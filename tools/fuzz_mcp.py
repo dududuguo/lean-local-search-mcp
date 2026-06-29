@@ -1,0 +1,208 @@
+#!/usr/bin/env python
+"""Small crash fuzzer for lean_local_search_mcp.py.
+
+Default mode builds a synthetic Lean-ish repo under the system temp directory,
+indexes it, then randomly calls MCP tool implementations directly. It avoids
+remove_project/proof_probe by default so it is safe to run often.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import random
+import shutil
+import string
+import sys
+import tempfile
+import traceback
+from pathlib import Path
+
+SERVER_PATH = Path(__file__).resolve().with_name("lean_local_search_mcp.py")
+
+
+def load_server():
+    spec = importlib.util.spec_from_file_location("lean_local_search_mcp_under_fuzz", SERVER_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {SERVER_PATH}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def write_file(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def make_repo(root: Path) -> None:
+    write_file(
+        root / "FuzzRepo.lean",
+        """import FuzzRepo.Basic
+import FuzzRepo.Matrix
+""",
+    )
+    write_file(
+        root / "FuzzRepo" / "Basic.lean",
+        """namespace Fuzz
+
+def idFun (x : Nat) : Nat := x
+
+theorem add_zero_shape (n : Nat) : n + 0 = n := by
+  exact Nat.add_zero n
+
+lemma has_deriv_shape (f : Real -> Real) (x y : Real) : HasDerivAt f y x -> HasDerivAt f y x := by
+  intro h
+  exact h
+
+end Fuzz
+""",
+    )
+    write_file(
+        root / "FuzzRepo" / "Matrix.lean",
+        """import FuzzRepo.Basic
+
+namespace Fuzz
+
+opaque MatrixLike : Type
+opaque cfc : (Real -> Real) -> MatrixLike -> MatrixLike
+opaque trace : MatrixLike -> Real
+opaque A : MatrixLike
+opaque f : Real -> Real
+
+theorem trace_cfc_shape : trace (cfc f A) = trace (cfc f A) := by
+  rfl
+
+lemma inv_affine_shape (g : Real -> MatrixLike) (t : Real) : HasDerivAt (fun s : Real => g s) A t -> HasDerivAt (fun s : Real => g s) A t := by
+  intro h
+  exact h
+
+end Fuzz
+""",
+    )
+    write_file(root / "docs" / "notes.md", "trace cfc HasDerivAt Matrix random text\n")
+
+
+def rand_text(rng: random.Random, max_len: int = 18) -> str:
+    alphabet = string.ascii_letters + string.digits + "_ .:/\\-*+()[]{}'\"≤≥∈→⁻¹•"
+    return "".join(rng.choice(alphabet) for _ in range(rng.randint(0, max_len)))
+
+
+def maybe(rng: random.Random, choices):
+    return rng.choice(choices)
+
+
+def random_args(rng: random.Random, tool: str, repo: Path, existing: bool):
+    names = [
+        "Fuzz.trace_cfc_shape",
+        "trace_cfc_shape",
+        "Fuzz.add_zero_shape",
+        "add_zero_shape",
+        "Fuzz.has_deriv_shape",
+        "missing_name",
+        "",
+        rand_text(rng),
+    ]
+    shapes = [
+        "trace (cfc f A) = _",
+        "HasDerivAt (fun t => g t) A t",
+        "n + 0 = n",
+        "Matrix.trace (cfc f A) = _",
+        rand_text(rng, 40),
+        "",
+    ]
+    patterns = ["trace", "cfc", "HasDerivAt", "Matrix", "", rand_text(rng, 16)]
+    scopes = [{}, {"path_prefix": "FuzzRepo"}, {"file_pattern": "*.lean"}, {"path_filter": "Matrix|Basic"}]
+    base_project = {"project": rng.choice(["default", "provider", "mathlib"])} if existing else {"repo_path": str(repo)}
+    if tool == "index_repository":
+        args = {"repo_path": str(repo), "mode": rng.choice(["incremental", "resume", "full"]), "batch_size": rng.randint(1, 20)}
+        args.update(rng.choice(scopes))
+        return args
+    if tool == "index_status":
+        args = dict(base_project); args.update({"details": rng.choice([True, False]), "detail_limit": rng.randint(1, 10)}); args.update(rng.choice(scopes)); return args
+    if tool == "index_visibility":
+        args = dict(base_project); args.update({"details": True, "detail_limit": rng.randint(1, 10)}); return args
+    if tool == "cache_status":
+        return dict(base_project) if rng.random() < 0.7 else {}
+    if tool == "search_graph":
+        args = dict(base_project); args.update({"query": rng.choice(patterns), "limit": rng.randint(1, 8), "offset": rng.randint(0, 3), "label": rng.choice([None, "Function", "Type", "theorem"])}); args.update(rng.choice(scopes)); return {k:v for k,v in args.items() if v is not None}
+    if tool == "search_theorems":
+        args = dict(base_project); args.update({"query": rng.choice(patterns), "limit": rng.randint(1, 8), "cards": rng.choice([True, False]), "include_source": rng.choice([True, False])}); args.update(rng.choice(scopes)); return args
+    if tool == "search_shape":
+        args = dict(base_project); args.update({"shape": rng.choice(shapes), "limit": rng.randint(1, 8), "cards": rng.choice([True, False]), "strict": rng.choice([True, False])}); args.update(rng.choice(scopes)); return args
+    if tool == "theorem_card":
+        args = dict(base_project); args.update({"qualified_name": rng.choice(names), "include_source": rng.choice([True, False])}); return args
+    if tool in {"get_context", "get_code_snippet"}:
+        args = dict(base_project); args.update({"qualified_name": rng.choice(names), "before": rng.randint(0, 5), "after": rng.randint(0, 5), "neighbor_radius": rng.randint(0, 3), "include_neighbors": rng.choice([True, False])}); return args
+    if tool == "search_code":
+        args = dict(base_project); args.update({"pattern": rng.choice(patterns), "limit": rng.randint(1, 8), "context": rng.randint(0, 3), "mode": rng.choice(["compact", "files", "full"]), "regex": False}); args.update(rng.choice(scopes)); return args
+    if tool == "trace_path":
+        args = dict(base_project); args.update({"qualified_name": rng.choice(names), "direction": rng.choice(["inbound", "outbound", "both", "weird"]), "depth": rng.randint(0, 3)}); return args
+    if tool == "get_architecture":
+        return dict(base_project)
+    if tool == "project_templates":
+        return {}
+    if tool == "cross_repo_lookup":
+        if existing:
+            return {"query": rng.choice(["trace_eq_sum_eigenvalues", "eigenvalues_mem_spectrum_real", "missing", rand_text(rng)]), "limit": rng.randint(1, 5)}
+        return {"query": rng.choice(names), "projects": ["default"], "limit": rng.randint(1, 5)}
+    if tool == "consumer_fit":
+        if existing:
+            return {"project": "provider", "consumer": "epsteinAffineLineConcavity_of_cfcLog_hasDerivAt_traceDerivative_nonpos", "projects": ["provider"], "max_obligations": 1, "candidates_per_obligation": 2}
+        return {"project": "default", "consumer": rng.choice(["Fuzz.trace_cfc_shape", "trace_cfc_shape", "missing_name"]), "projects": ["default"], "max_obligations": 2, "candidates_per_obligation": 3}
+    return {}
+
+
+def assert_jsonable(value):
+    json.dumps(value, ensure_ascii=False)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--iterations", type=int, default=300)
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--include-existing", action="store_true", help="Also fuzz read-only calls against provider/mathlib aliases.")
+    ap.add_argument("--keep-temp", action="store_true")
+    args = ap.parse_args()
+    seed = args.seed if args.seed is not None else random.randrange(1 << 32)
+    rng = random.Random(seed)
+    mod = load_server()
+    temp_root = Path(tempfile.mkdtemp(prefix="lean-local-search-fuzz-"))
+    failures = []
+    tools = [
+        "index_repository", "index_status", "index_visibility", "cache_status", "search_graph",
+        "search_theorems", "search_shape", "theorem_card", "get_context", "get_code_snippet",
+        "search_code", "trace_path", "get_architecture", "project_templates", "cross_repo_lookup",
+        "consumer_fit",
+    ]
+    try:
+        make_repo(temp_root)
+        initial = mod.index_repository({"mode": "full", "batch_size": 5}, temp_root)
+        assert_jsonable(initial)
+        for i in range(args.iterations):
+            existing = args.include_existing and rng.random() < 0.25
+            tool = rng.choice([t for t in tools if existing or t != "index_repository"])
+            call_args = random_args(rng, tool, temp_root, existing)
+            try:
+                result = mod.call_tool(tool, call_args, temp_root)
+                assert_jsonable(result)
+            except Exception as exc:  # noqa: BLE001 - fuzzer records all crashes
+                failures.append({
+                    "iteration": i,
+                    "tool": tool,
+                    "args": call_args,
+                    "exception": repr(exc),
+                    "traceback": traceback.format_exc(),
+                })
+                if len(failures) >= 10:
+                    break
+        summary = {"seed": seed, "iterations": args.iterations, "temp_repo": str(temp_root), "failures": failures}
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 1 if failures else 0
+    finally:
+        if not args.keep_temp and not failures:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -10,6 +10,8 @@ This repository was split out from the first MVP inside `HighDimProbLiebProvider
 | `C:\Users\11388\reserach\HighDimProbLiebProvider` | incremental | 258 | 513 | 341 | No-op reindex reported `changed_files: 0`, `skipped_files: 258`. |
 | `C:\Users\11388\reserach\HighDimProb` | full | 712 | 2144 | 747 | Full main project indexed. Do not use only `HighDimProb\docs` when looking for Lean declarations. |
 | `C:\Users\11388\reserach\HighDimProb` | incremental | 712 | 2144 | 747 | No-op reindex reported `changed_files: 0`, `skipped_files: 712`. |
+| `C:\Users\11388\reserach\HighDimProbLiebProvider\.lake\packages\mathlib` | full | 8407 | 209309 | 1787 | Provider Mathlib checkout indexed through the `mathlib` alias. |
+| `C:\Users\11388\reserach\HighDimProbLiebProvider\.lake\packages\mathlib` | incremental | 8407 | 209309 | 1787 | No-op reindex reported `changed_files: 0`, `skipped_files: 8407`. |
 
 ## MCP Protocol Checks
 
@@ -18,6 +20,8 @@ Validated `tools/list` exposes short aliases without duplicate project entries:
 ```text
 provider, HighDimProbLiebProvider -> C:\Users\11388\reserach\HighDimProbLiebProvider
 highdimprob, HighDimProb, main -> C:\Users\11388\reserach\HighDimProb
+mathlib, Mathlib, provider-mathlib -> C:\Users\11388\reserach\HighDimProbLiebProvider\.lake\packages\mathlib
+highdimprob-mathlib -> C:\Users\11388\reserach\HighDimProb\.lake\packages\mathlib
 ```
 
 Validated `tools/list` exposes these post-MVP tools:
@@ -46,6 +50,17 @@ conclusion: matrixBernsteinTraceMGFWithBernsteinCoeff_statement P A theta R
 includes: imports, local_header, theorem_profile, neighbors, source, source_context
 ```
 
+Validated Mathlib theorem search and context:
+
+```text
+project: mathlib
+query: eigenvalues_mem_spectrum_real
+first theorem: Matrix.IsHermitian.eigenvalues_mem_spectrum_real
+file: Mathlib/Analysis/Matrix/Spectrum.lean:81
+conclusion: hA.eigenvalues i in spectrum R A
+get_context includes: local_header, theorem_profile, neighbors, source, source_context
+```
+
 Validated cache removal in the same MCP process:
 
 ```text
@@ -63,6 +78,25 @@ status: ready
 is_stale: false
 ```
 
+
+Validated API visibility tools:
+
+```text
+index_repository project=mathlib topic=Matrix mode=resume: changed_files=0, skipped_files=95
+index_status project=mathlib topic=Matrix details=true: current_scope_files=95, indexed_scope_files=95
+search_shape project=mathlib shape="Matrix.trace (cfc f A) = _": strict hit count 0, relaxed fallback enabled
+proof_probe #check Matrix.IsHermitian.eigenvalues_mem_spectrum_real: ok=true, import=Mathlib.Analysis.Matrix.Spectrum
+index_visibility project=provider: tracked_only=false, indexed_untracked_files=4, root=HighDimProbLiebProvider.lean
+cross_repo_lookup trace_eq_sum_eigenvalues: found Mathlib declaration and HighDimProb textual users
+consumer_fit epsteinAffineLineConcavity_of_cfcLog_hasDerivAt_traceDerivative_nonpos: found provider and HighDimProb shape-near candidates
+```
+
+Validated fuzz runner:
+
+```text
+python tools/fuzz_mcp.py --iterations 300 --seed 1700001: failures=[]
+python tools/fuzz_mcp.py --iterations 80 --seed 1700002 --include-existing: failures=[]
+```
 ## Bugs Fixed During Validation
 
 - `remove_project` initially failed on Windows because the same MCP process still held an open SQLite connection after indexing. Index/status/project lookup code now closes SQLite connections before returning.

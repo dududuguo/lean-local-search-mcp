@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Tiny local Lean search MCP server: tree-sitter + SQLite FTS5, no models."""
 from __future__ import annotations
-import argparse, fnmatch, json, os, re, sqlite3, sys, time
+import argparse, fnmatch, json, os, re, sqlite3, subprocess, sys, time
 from pathlib import Path
 if hasattr(sys.stdout, "reconfigure"): sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"): sys.stderr.reconfigure(encoding="utf-8")
@@ -17,6 +17,18 @@ THEOREM_KINDS = {"theorem","lemma","abbrev"}
 TYPE_KINDS = {"structure","class","inductive"}
 STOP_SYMBOLS = {"theorem","lemma","def","abbrev","instance","structure","class","inductive","axiom","opaque","constant","example","by","where","let","have","show","fun","forall","Prop","Type","Sort","True","False","Nat","Int","Real","Complex"}
 RELATION_MARKERS = [" = "," < "," > ","<=",">=","->","\\le","\\ge","\\in","\u2264","\u2265","\u2208","\u2192","\u2194"]
+TOPIC_PATHS = {
+    "matrix": ["Mathlib/Analysis/Matrix", "Mathlib/LinearAlgebra/Matrix", "Mathlib/Data/Matrix"],
+    "cfc": ["Mathlib/Analysis/CStarAlgebra/ContinuousFunctionalCalculus"],
+    "intervalintegral": ["Mathlib/MeasureTheory/Integral/IntervalIntegral"],
+    "interval_integral": ["Mathlib/MeasureTheory/Integral/IntervalIntegral"],
+    "measuretheory": ["Mathlib/MeasureTheory"],
+    "measure_theory": ["Mathlib/MeasureTheory"],
+    "specialfunctions": ["Mathlib/Analysis/SpecialFunctions"],
+    "special_functions": ["Mathlib/Analysis/SpecialFunctions"],
+    "resolvent": ["Mathlib/Analysis/Matrix", "Mathlib/LinearAlgebra/Matrix", "Mathlib/Analysis/CStarAlgebra"],
+}
+DEFAULT_CROSS_PROJECTS = ["provider", "highdimprob", "mathlib"]
 DECL_RE = re.compile(r"(?m)^\s*(?:@[^\n]*\n\s*)*(?:private\s+|protected\s+|noncomputable\s+|unsafe\s+|partial\s+)*(theorem|lemma|def|abbrev|instance|structure|class|inductive|axiom|opaque|constant|example)\b\s*([^\s:(\[{]+)?")
 IMPORT_RE = re.compile(r"(?m)^\s*import\s+(.+?)\s*$")
 NS_RE = re.compile(r"^\s*namespace\s+([A-Za-z0-9_.'`]+)\s*$")
@@ -26,15 +38,36 @@ IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_'.]*\b")
 def log(msg):
     print(f"[{SERVER_NAME}] {msg}", file=sys.stderr, flush=True)
 
+def local_mathlib_roots():
+    base = SERVER_REPO.parent
+    roots = [
+        ("provider-mathlib", base / "HighDimProbLiebProvider" / ".lake" / "packages" / "mathlib"),
+        ("highdimprob-mathlib", base / "HighDimProb" / ".lake" / "packages" / "mathlib"),
+    ]
+    return [(name, path.resolve()) for name, path in roots if path.exists()]
+
+
+def default_mathlib_root():
+    roots = local_mathlib_roots()
+    return roots[0][1] if roots else None
+
+
 def local_repo_aliases():
     base = SERVER_REPO.parent
-    return {
+    aliases = {
         "provider": base / "HighDimProbLiebProvider",
         "HighDimProbLiebProvider": base / "HighDimProbLiebProvider",
         "highdimprob": base / "HighDimProb",
         "HighDimProb": base / "HighDimProb",
         "main": base / "HighDimProb",
     }
+    mathlib = default_mathlib_root()
+    if mathlib:
+        aliases["mathlib"] = mathlib
+        aliases["Mathlib"] = mathlib
+    for name, path in local_mathlib_roots():
+        aliases[name] = path
+    return aliases
 
 
 def alias_repo(name):
@@ -134,27 +167,97 @@ def repo_arg(args, fallback):
 def db_path_from_args(args, fallback):
     project = args.get("project")
     raw = args.get("repo_path") or args.get("path") or args.get("root")
+    if project and not raw:
+        aliased = alias_repo(project)
+        if aliased:
+            return db_path(aliased).resolve()
     if project and not raw and not (":" in str(project) or "\\" in str(project) or "/" in str(project)):
         candidate = index_root() / (str(project) + ".sqlite3")
         if candidate.exists():
             return candidate.resolve()
     return db_path(repo_arg(args, fallback)).resolve()
 
-def indexed_files(repo):
+def as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(x) for x in value if str(x).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    if "\n" in text:
+        return [x.strip() for x in text.splitlines() if x.strip()]
+    return [x.strip() for x in text.split(",") if x.strip()] if "," in text else [text]
+
+
+def norm_rel(value):
+    return str(value or "").replace("\\", "/").lstrip("./")
+
+
+def topic_prefixes(args):
+    prefixes = []
+    for topic in as_list(args.get("topic") or args.get("topics")):
+        prefixes.extend(TOPIC_PATHS.get(topic.lower(), [topic]))
+    return [norm_rel(x).rstrip("/") for x in prefixes if str(x).strip()]
+
+
+def scope_prefixes(args):
+    prefixes = []
+    prefixes.extend(as_list(args.get("path_prefix") or args.get("prefix")))
+    prefixes.extend(as_list(args.get("paths")))
+    prefixes.extend(topic_prefixes(args))
+    return [norm_rel(x).rstrip("/") for x in prefixes if str(x).strip()]
+
+
+def has_scope(args):
+    return bool(args and (args.get("file_pattern") or args.get("path_filter") or args.get("path_prefix") or args.get("prefix") or args.get("paths") or args.get("topic") or args.get("topics")))
+
+
+def file_in_scope(rel, args):
+    if not args:
+        return True
+    rel = norm_rel(rel)
+    file_pat = args.get("file_pattern")
+    if file_pat and not fnmatch.fnmatch(rel, str(file_pat)):
+        return False
+    path_filter = args.get("path_filter")
+    if path_filter and not re.search(str(path_filter), rel):
+        return False
+    prefixes = scope_prefixes(args)
+    if prefixes:
+        ok = False
+        for prefix in prefixes:
+            if rel == prefix or rel.startswith(prefix + "/") or fnmatch.fnmatch(rel, prefix):
+                ok = True
+                break
+        if not ok:
+            return False
+    return True
+
+
+def scope_description(args):
+    return {"topics": as_list(args.get("topic") or args.get("topics")), "prefixes": scope_prefixes(args), "file_pattern": args.get("file_pattern"), "path_filter": args.get("path_filter")}
+
+
+def indexed_files(repo, args=None):
     out = []
     for p in repo.rglob("*"):
         if not p.is_file():
             continue
         if p.suffix.lower() not in TEXT_EXTENSIONS:
             continue
-        if any(part in EXCLUDES for part in p.relative_to(repo).parts):
+        rel_parts = p.relative_to(repo).parts
+        if any(part in EXCLUDES for part in rel_parts):
+            continue
+        rel = Path(*rel_parts).as_posix()
+        if not file_in_scope(rel, args or {}):
             continue
         out.append(p)
     return sorted(out)
 
+
 def lean_files(repo):
     return indexed_files(repo)
-
 def line_of(data, byte):
     return data[:max(0, byte)].count(b"\n") + 1
 
@@ -454,52 +557,101 @@ def total_imports(con):
             nimports += sum(1 for _ in IMPORT_RE.finditer(r["content"]))
     return nimports
 
-def stale_summary(repo, con):
+def stale_summary(repo, con, args=None, details=False):
     current = {}
+    args = args or {}
     if Path(repo).exists():
-        for p in indexed_files(repo):
+        for p in indexed_files(repo, args):
             st = p.stat()
             current[p.relative_to(repo).as_posix()] = (st.st_mtime_ns, st.st_size)
-    indexed = {r["path"]: (r["mtime_ns"], r["size"]) for r in con.execute("SELECT path,mtime_ns,size FROM files")}
+    indexed_all = {r["path"]: (r["mtime_ns"], r["size"]) for r in con.execute("SELECT path,mtime_ns,size FROM files")}
+    indexed = {rel: stamp for rel, stamp in indexed_all.items() if file_in_scope(rel, args)}
     removed = sorted(set(indexed) - set(current))
     added = sorted(set(current) - set(indexed))
     changed = sorted(rel for rel in set(current) & set(indexed) if current[rel] != indexed[rel])
-    return {"added_files": len(added), "changed_files": len(changed), "removed_files": len(removed), "is_stale": bool(added or changed or removed)}
+    out = {"added_files": len(added), "changed_files": len(changed), "removed_files": len(removed), "is_stale": bool(added or changed or removed)}
+    if details:
+        limit = int(args.get("detail_limit") or args.get("limit") or 30)
+        out.update({"scope": scope_description(args), "added": added[:limit], "changed": changed[:limit], "removed": removed[:limit], "current_scope_files": len(current), "indexed_scope_files": len(indexed)})
+    return out
+
+
+def background_index(args, repo):
+    bg_args = dict(args)
+    bg_args.pop("background", None)
+    index_root().mkdir(parents=True, exist_ok=True)
+    log_path = index_root() / (project_name(repo) + ".index.log")
+    cmd = [sys.executable, str(Path(__file__).resolve()), "--repo", str(repo), "--index-args", json.dumps(bg_args, ensure_ascii=False)]
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    out = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(repo), stdout=out, stderr=out, creationflags=flags)
+    finally:
+        out.close()
+    return {"background": True, "pid": proc.pid, "project": project_name(repo), "repo_path": str(repo), "db_path": str(db_path(repo)), "log_path": str(log_path), "args": bg_args}
 
 
 def index_repository(args, repo):
+    if args.get("background"):
+        return background_index(args, repo)
     t0 = time.time(); con = connect(repo)
     mode = str(args.get("mode") or "incremental").lower()
-    current_paths = indexed_files(repo)
+    resume = mode in {"resume", "continue"} or bool(args.get("resume"))
+    batch_size = max(1, int(args.get("batch_size") or 200))
+    current_paths = indexed_files(repo, args)
     current = {}
     for p in current_paths:
         st = p.stat()
         current[p.relative_to(repo).as_posix()] = {"path": p, "mtime_ns": st.st_mtime_ns, "size": st.st_size}
     meta_indexed = con.execute("SELECT value FROM meta WHERE key='indexed_at'").fetchone()
     meta_schema = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-    full = mode in {"full", "rebuild", "force"} or meta_indexed is None or (meta_schema is None or meta_schema["value"] != SCHEMA_VERSION)
+    scoped = has_scope(args)
+    full_requested = mode in {"full", "rebuild", "force"}
+    full = (full_requested and not resume) or meta_indexed is None or (meta_schema is None or meta_schema["value"] != SCHEMA_VERSION)
+    indexed = {r["path"]: (r["mtime_ns"], r["size"]) for r in con.execute("SELECT path,mtime_ns,size FROM files")}
     changed_rels, removed_rels = [], []
     with con:
-        if full:
-            con.execute("DELETE FROM decl_fts"); con.execute("DELETE FROM decls"); con.execute("DELETE FROM files")
-            changed_rels = sorted(current)
-        else:
-            indexed = {r["path"]: (r["mtime_ns"], r["size"]) for r in con.execute("SELECT path,mtime_ns,size FROM files")}
-            removed_rels = sorted(set(indexed) - set(current))
-            changed_rels = sorted(rel for rel, st in current.items() if rel not in indexed or indexed[rel] != (st["mtime_ns"], st["size"]))
-            for rel in removed_rels + changed_rels:
-                delete_file_index(con, rel)
-        seen_qn = set(r["qn"] for r in con.execute("SELECT qn FROM decls"))
-        nchanged_decls = 0
-        for rel in changed_rels:
-            nchanged_decls += insert_file_index(con, repo, current[rel]["path"], seen_qn)
-        con.execute("INSERT OR REPLACE INTO meta VALUES ('indexed_at', ?)", (str(int(time.time())),))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('repo_path', ?)", (str(repo),))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", (SCHEMA_VERSION,))
-    result = {"project": project_name(repo), "repo_path": str(repo), "db_path": str(db_path(repo)), "mode": "full" if full else "incremental", "indexed_files": table_count(con, "files"), "declarations": table_count(con, "decls"), "imports": total_imports(con), "changed_files": len(changed_rels), "changed_declarations": nchanged_decls, "removed_files": len(removed_rels), "skipped_files": max(0, len(current) - len(changed_rels)), "elapsed_ms": round((time.time() - t0) * 1000)}
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('index_phase', 'running')")
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('index_started_at', ?)", (str(int(time.time())),))
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('index_scope', ?)", (json.dumps(scope_description(args), ensure_ascii=False),))
+        if full and not scoped:
+            con.execute("DELETE FROM decl_fts"); con.execute("DELETE FROM decls"); con.execute("DELETE FROM files")
+            changed_rels = sorted(current)
+        elif full and scoped:
+            indexed_in_scope = {rel for rel in indexed if file_in_scope(rel, args)}
+            removed_rels = sorted(indexed_in_scope - set(current))
+            changed_rels = sorted(current)
+            for rel in removed_rels + changed_rels:
+                delete_file_index(con, rel)
+        else:
+            indexed_in_scope = {rel: stamp for rel, stamp in indexed.items() if file_in_scope(rel, args)}
+            removed_rels = sorted(set(indexed_in_scope) - set(current))
+            changed_rels = sorted(rel for rel, st in current.items() if rel not in indexed_in_scope or indexed_in_scope[rel] != (st["mtime_ns"], st["size"]))
+            for rel in removed_rels + changed_rels:
+                delete_file_index(con, rel)
+    seen_qn = set(r["qn"] for r in con.execute("SELECT qn FROM decls"))
+    nchanged_decls = 0
+    processed = 0
+    pending = 0
+    for rel in changed_rels:
+        if pending == 0:
+            con.execute("BEGIN")
+        nchanged_decls += insert_file_index(con, repo, current[rel]["path"], seen_qn)
+        processed += 1; pending += 1
+        if pending >= batch_size:
+            con.execute("INSERT OR REPLACE INTO meta VALUES ('last_index_progress', ?)", (json.dumps({"processed": processed, "total": len(changed_rels), "last_file": rel, "time": int(time.time())}, ensure_ascii=False),))
+            con.commit(); pending = 0
+    if pending:
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('last_index_progress', ?)", (json.dumps({"processed": processed, "total": len(changed_rels), "last_file": changed_rels[-1] if changed_rels else None, "time": int(time.time())}, ensure_ascii=False),))
+        con.commit()
+    with con:
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('indexed_at', ?)", (str(int(time.time())),))
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('index_phase', 'ready')")
+    result = {"project": project_name(repo), "repo_path": str(repo), "db_path": str(db_path(repo)), "mode": "full" if full and not resume else "resume" if resume else "incremental", "scope": scope_description(args), "indexed_files": table_count(con, "files"), "declarations": table_count(con, "decls"), "imports": total_imports(con), "changed_files": len(changed_rels), "changed_declarations": nchanged_decls, "removed_files": len(removed_rels), "skipped_files": max(0, len(current) - len(changed_rels)), "batch_size": batch_size, "elapsed_ms": round((time.time() - t0) * 1000)}
     con.close()
     return result
-
 
 def reindex(repo):
     return index_repository({"mode": "full"}, repo)
@@ -522,6 +674,56 @@ def theorem_result(r):
     out.update({"statement": r["stmt"], "conclusion": r["conclusion"] or "", "premises": [x for x in (r["premises"] or "").splitlines() if x.strip()], "head_symbols": [x for x in (r["head_symbols"] or "").split() if x.strip()]})
     return out
 
+
+def module_name_from_file(rel):
+    rel = norm_rel(rel)
+    return rel[:-5].replace("/", ".") if rel.endswith(".lean") else ""
+
+
+def import_for_file(rel):
+    return module_name_from_file(rel)
+
+
+def header_lines_before(con, r, limit=40):
+    fr = con.execute("SELECT content FROM files WHERE path=?", (r["file"],)).fetchone()
+    lines = fr["content"].splitlines() if fr else []
+    header_lines = []
+    for i, line in enumerate(lines[:max(0, r["start_line"] - 1)], 1):
+        stripped = line.strip()
+        if stripped.startswith(("open ", "variable ", "variables ", "section ", "namespace ", "local ", "attribute ")):
+            header_lines.append({"line": i, "text": line})
+    return header_lines[-limit:]
+
+
+def key_typeclasses(stmt, header_lines):
+    text = "\n".join([stmt or ""] + [h.get("text", "") for h in header_lines])
+    seen, out = set(), []
+    for item in re.findall(r"\[[^\[\]\n]+\]", text):
+        clean = " ".join(item.strip("[]").split())
+        if clean and clean not in seen:
+            seen.add(clean); out.append(clean)
+        if len(out) >= 20:
+            break
+    return out
+
+
+def theorem_card(repo, con, r, include_source=False):
+    header = header_lines_before(con, r)
+    import_module = import_for_file(r["file"])
+    card = theorem_result(r)
+    card.update({
+        "import": import_module,
+        "source_location": f"{Path(repo) / r['file']}:{r['start_line']}",
+        "namespace": r["namespace"] or "",
+        "docstring": r["doc"] or "",
+        "binders": json.loads(r["binders_json"] or "[]"),
+        "key_typeclasses": key_typeclasses(r["stmt"], header),
+        "minimal_check": f"import {import_module}\n#check {r['qn']}",
+        "local_header": header,
+    })
+    if include_source:
+        card["source"] = r["src"]
+    return card
 def fts(q):
     toks = re.findall(r"[A-Za-z0-9_'.]+", str(q))
     return " OR ".join(f'"{t}"' for t in toks) if toks else str(q).replace('"', '""')
@@ -588,6 +790,7 @@ def search_theorems(args, repo):
     scored = []
     for r in rows:
         if file_pat and not fnmatch.fnmatch(r["file"], str(file_pat)): continue
+        if not file_in_scope(r["file"], args): continue
         if name_pat and not re.search(str(name_pat), r["name"]): continue
         if qn_pat and not re.search(str(qn_pat), r["qn"]): continue
         short_name = r["name"] or ""
@@ -602,7 +805,6 @@ def search_theorems(args, repo):
         if toks:
             compact = "".join(toks)
             short_lower = short_name.lower()
-            qn_lower = qn_text.lower()
             if compact and short_lower.startswith(compact): score += 260
             elif compact and compact in short_lower: score += 220
             elif contains_all(short_name, toks): score += 180
@@ -621,7 +823,107 @@ def search_theorems(args, repo):
     scored.sort(key=lambda x: (-x[0], x[1]["kind"] != "theorem", x[1]["file"], x[1]["start_line"]))
     filt = [r for _, r in scored]
     page = filt[offset:offset+limit]
-    return {"total": len(filt), "results": [theorem_result(r) for r in page], "has_more": offset + len(page) < len(filt)}
+    use_cards = bool(args.get("cards") or args.get("card"))
+    results = [theorem_card(repo, con, r, bool(args.get("include_source"))) if use_cards else theorem_result(r) for r in page]
+    con.close()
+    return {"total": len(filt), "results": results, "has_more": offset + len(page) < len(filt)}
+SHAPE_STOP = STOP_SYMBOLS | {"fun", "Function", "Set", "by", "exact", "rw", "simp", "the", "if", "then", "else"}
+SHAPE_OPS = [("⁻¹", "inv"), ("•", "smul"), ("=", "eq"), ("≤", "le"), ("<=", "le"), ("≥", "ge"), (">=", "ge"), ("∈", "mem"), ("+", "add"), ("-", "sub"), ("*", "mul"), ("/", "div"), ("∫", "integral"), ("HasDerivAt", "HasDerivAt"), ("Matrix.trace", "Matrix.trace"), ("trace", "trace"), ("cfc", "cfc"), ("intervalIntegral", "intervalIntegral"), ("Real.log", "Real.log")]
+IMPORTANT_SHAPE_TERMS = {"cfc", "trace", "hasderivat", "inv", "smul", "real.log", "intervalintegral", "integral"}
+
+
+def shape_terms(text):
+    text = str(text or "")
+    terms = []
+    for needle, token in SHAPE_OPS:
+        if needle in text:
+            terms.append(token.lower())
+    for ident in IDENT_RE.findall(text):
+        short = ident.split(".")[-1]
+        if ident in SHAPE_STOP or short in SHAPE_STOP:
+            continue
+        if len(short) == 1:
+            continue
+        terms.append(ident.lower())
+        if "." in ident:
+            terms.append(short.lower())
+    seen, out = set(), []
+    for t in terms:
+        if t and t not in seen:
+            seen.add(t); out.append(t)
+    return out
+
+
+def ordered_hits(query_terms, candidate_terms):
+    pos, hits = 0, 0
+    for qt in query_terms:
+        try:
+            idx = candidate_terms.index(qt, pos)
+        except ValueError:
+            continue
+        hits += 1; pos = idx + 1
+    return hits
+
+
+def shape_score(query_terms, row, require_important=True):
+    text = "\n".join([row["stmt"] or "", row["conclusion"] or "", row["premises"] or "", row["head_symbols"] or "", row["qn"] or ""])
+    cand = shape_terms(text)
+    if not query_terms or not cand:
+        return 0, cand, []
+    required = [t for t in query_terms if t in IMPORTANT_SHAPE_TERMS]
+    if require_important and any(t not in cand for t in required):
+        return 0, cand, []
+    overlap = [t for t in query_terms if t in cand]
+    if not overlap:
+        return 0, cand, []
+    score = 20 * len(set(overlap)) + 6 * ordered_hits(query_terms, cand)
+    if all(t in cand for t in query_terms):
+        score += 80
+    for a, b in zip(query_terms, query_terms[1:]):
+        if a in cand and b in cand and cand.index(a) < cand.index(b):
+            score += 8
+    if row["kind"] == "theorem":
+        score += 5
+    return score, cand, overlap
+
+
+def search_shape(args, repo):
+    ensure_index(repo); con = connect(repo)
+    shape = args.get("shape") or args.get("query") or args.get("type") or ""
+    qterms = shape_terms(shape)
+    limit = int(args.get("limit") or 20); offset = int(args.get("offset") or 0)
+    min_score = int(args.get("min_score") or 1)
+    file_pat = args.get("file_pattern")
+    rows = list(con.execute("SELECT * FROM decls WHERE kind IN ('theorem','lemma','abbrev')"))
+    scored = []
+    for r in rows:
+        if file_pat and not fnmatch.fnmatch(r["file"], str(file_pat)): continue
+        if not file_in_scope(r["file"], args): continue
+        score, cand_terms, overlap = shape_score(qterms, r)
+        if score < min_score:
+            continue
+        scored.append((score, overlap, cand_terms, r))
+    relaxed = False
+    if not scored and not args.get("strict"):
+        relaxed = True
+        for r in rows:
+            if file_pat and not fnmatch.fnmatch(r["file"], str(file_pat)): continue
+            if not file_in_scope(r["file"], args): continue
+            score, cand_terms, overlap = shape_score(qterms, r, False)
+            if score < min_score:
+                continue
+            scored.append((score, overlap, cand_terms, r))
+    scored.sort(key=lambda x: (-x[0], x[3]["kind"] != "theorem", x[3]["file"], x[3]["start_line"]))
+    page = scored[offset:offset+limit]
+    results = []
+    for score, overlap, cand_terms, r in page:
+        item = theorem_card(repo, con, r, bool(args.get("include_source"))) if args.get("cards", True) else theorem_result(r)
+        item["shape_score"] = score
+        item["matched_shape_terms"] = overlap
+        item["candidate_shape_terms"] = cand_terms[:40]
+        results.append(item)
+    con.close()
+    return {"shape": shape, "shape_terms": qterms, "relaxed": relaxed, "total": len(scored), "results": results, "has_more": offset + len(page) < len(scored)}
 
 def containing(con, file, line):
     return con.execute("SELECT * FROM decls WHERE file=? AND start_line<=? AND end_line>=? ORDER BY (end_line-start_line) LIMIT 1", (file,line,line)).fetchone()
@@ -728,13 +1030,94 @@ def get_architecture(args, repo):
 def index_status(args, repo):
     con = connect(repo); meta = con.execute("SELECT value FROM meta WHERE key='indexed_at'").fetchone()
     schema = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    phase = con.execute("SELECT value FROM meta WHERE key='index_phase'").fetchone()
+    progress = con.execute("SELECT value FROM meta WHERE key='last_index_progress'").fetchone()
+    scope = con.execute("SELECT value FROM meta WHERE key='index_scope'").fetchone()
     db = db_path(repo)
-    status = "ready" if meta and schema and schema["value"] == SCHEMA_VERSION else "not_indexed" if meta is None else "needs_reindex"
+    if phase and phase["value"] == "running":
+        status = "indexing_or_interrupted"
+    else:
+        status = "ready" if meta and schema and schema["value"] == SCHEMA_VERSION else "not_indexed" if meta is None else "needs_reindex"
     out = {"project": project_name(repo), "repo_path": str(repo), "db_path": str(db), "schema_version": schema["value"] if schema else None, "status": status, "indexed_at": int(meta["value"]) if meta else None, "files": table_count(con, "files"), "declarations": table_count(con, "decls"), "cache_bytes": db.stat().st_size if db.exists() else 0}
-    out.update(stale_summary(repo, con))
+    if progress:
+        try: out["last_index_progress"] = json.loads(progress["value"])
+        except Exception: out["last_index_progress"] = progress["value"]
+    if scope:
+        try: out["last_index_scope"] = json.loads(scope["value"])
+        except Exception: out["last_index_scope"] = scope["value"]
+    out.update(stale_summary(repo, con, args, bool(args.get("details"))))
     con.close()
     return out
 
+
+def git_file_sets(repo):
+    repo = Path(repo)
+    if not (repo / ".git").exists():
+        return {"available": False, "tracked": set(), "untracked": set(), "error": None}
+    try:
+        tracked = subprocess.run(["git", "-C", str(repo), "ls-files", "--cached"], text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=20)
+        untracked = subprocess.run(["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard"], text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=20)
+        if tracked.returncode != 0 or untracked.returncode != 0:
+            return {"available": False, "tracked": set(), "untracked": set(), "error": (tracked.stderr + untracked.stderr).strip()}
+        return {"available": True, "tracked": {norm_rel(x) for x in tracked.stdout.splitlines() if x.strip()}, "untracked": {norm_rel(x) for x in untracked.stdout.splitlines() if x.strip()}, "error": None}
+    except Exception as exc:
+        return {"available": False, "tracked": set(), "untracked": set(), "error": str(exc)}
+
+
+def root_module_candidates(repo, con):
+    files = {r["path"] for r in con.execute("SELECT path FROM files WHERE path LIKE '%.lean'")}
+    roots = []
+    for name in [Path(repo).name, "Mathlib", "HighDimProb", "HighDimProbLiebProvider"]:
+        rel = f"{name}.lean"
+        if rel in files and rel not in roots:
+            roots.append(rel)
+    if not roots:
+        roots.extend(sorted(rel for rel in files if "/" not in rel)[:5])
+    return roots
+
+
+def root_import_visibility(repo, con, args=None):
+    args = args or {}
+    rows = list(con.execute("SELECT path,content FROM files WHERE path LIKE '%.lean'"))
+    content = {r["path"]: r["content"] for r in rows}
+    module_to_file = {module_name_from_file(path): path for path in content}
+    roots = [norm_rel(x) for x in as_list(args.get("root") or args.get("roots"))] or root_module_candidates(repo, con)
+    graph = {}
+    for path, body in content.items():
+        deps = []
+        for m in IMPORT_RE.finditer(body or ""):
+            for mod in m.group(1).split():
+                rel = module_to_file.get(mod)
+                if rel:
+                    deps.append(rel)
+        graph[path] = deps
+    seen, stack = set(), list(roots)
+    while stack:
+        rel = stack.pop()
+        if rel in seen or rel not in graph:
+            continue
+        seen.add(rel); stack.extend(graph.get(rel, []))
+    unexposed = sorted(rel for rel in set(content) - seen if file_in_scope(rel, args))
+    return {"roots": roots, "reachable_files": len(seen), "lean_files": len(content), "unexposed_files": len(unexposed), "unexposed_sample": unexposed[:int(args.get("detail_limit") or 30)]}
+
+
+def index_visibility(args, repo):
+    con = connect(repo)
+    out = index_status(args, repo)
+    git_sets = git_file_sets(repo)
+    if git_sets["available"]:
+        indexed = {norm_rel(r["path"]) for r in con.execute("SELECT path FROM files")}
+        current = {p.relative_to(repo).as_posix() for p in indexed_files(repo, args)}
+        out["git"] = {"available": True, "indexed_tracked_files": len(indexed & git_sets["tracked"]), "indexed_untracked_files": len(indexed & git_sets["untracked"]), "current_untracked_files": len(current & git_sets["untracked"]), "tracked_only": len(indexed & git_sets["untracked"]) == 0}
+        if args.get("details", True):
+            limit = int(args.get("detail_limit") or 30)
+            out["git"]["indexed_untracked_sample"] = sorted(indexed & git_sets["untracked"])[:limit]
+            out["git"]["current_untracked_sample"] = sorted(current & git_sets["untracked"])[:limit]
+    else:
+        out["git"] = {"available": False, "error": git_sets["error"]}
+    out["root_import_visibility"] = root_import_visibility(repo, con, args)
+    con.close()
+    return out
 
 def indexed_projects(default_repo):
     projects, seen = [], set()
@@ -749,6 +1132,9 @@ def indexed_projects(default_repo):
             item["cache_bytes"] = Path(db).stat().st_size
         projects.append(item)
     add(default_repo, db_path(default_repo))
+    for repo in local_repo_aliases().values():
+        if repo.exists():
+            add(repo, db_path(repo))
     root = index_root()
     if root.exists():
         for db in sorted(root.glob("*.sqlite3")):
@@ -796,14 +1182,185 @@ def trace_path(args, repo):
             outbound = [row_result(r) for r in con.execute(f"SELECT * FROM decls WHERE name IN ({qs}) LIMIT 100", tuple(names)) if r["id"] != d["id"]]
     return {"found": True, "mode": "approximate_identifier_text", "target": row_result(d), "inbound": inbound, "outbound": outbound}
 
+def theorem_card_tool(args, repo):
+    ensure_index(repo); con = connect(repo)
+    q = str(args.get("qualified_name") or args.get("name") or "")
+    r, rows = lookup_decl(con, q)
+    if r is None and not rows:
+        sug = con.execute("SELECT qn qualified_name,name,kind,file file_path,start_line FROM decls WHERE qn LIKE ? OR name LIKE ? LIMIT 10", (f"%{q}%", f"%{q}%")).fetchall()
+        con.close(); return {"found": False, "suggestions": [dict(x) for x in sug]}
+    if r is None:
+        con.close(); return {"found": False, "ambiguous": True, "suggestions": [dict(x) for x in rows]}
+    out = theorem_card(repo, con, r, bool(args.get("include_source")))
+    con.close(); return {"found": True, "card": out}
+
+
+def normalize_imports(value):
+    imports = []
+    for item in as_list(value):
+        for part in item.split():
+            part = part.strip()
+            if part and part != "import":
+                imports.append(part)
+    seen, out = set(), []
+    for imp in imports:
+        if imp not in seen:
+            seen.add(imp); out.append(imp)
+    return out
+
+
+def diagnose_lean_output(text):
+    lower = str(text or "").lower()
+    tags = []
+    if "unknown constant" in lower or "unknown identifier" in lower:
+        tags.append("missing_import_or_unknown_name")
+    if "application type mismatch" in lower or "type mismatch" in lower:
+        tags.append("type_mismatch")
+    if "failed to synthesize" in lower:
+        tags.append("missing_typeclass_or_instance")
+    if "unsolved goals" in lower:
+        tags.append("unsolved_goals")
+    if "invalid field notation" in lower or "coe" in lower:
+        tags.append("possible_coe_or_normal_form_issue")
+    return tags or (["ok"] if "error:" not in lower else ["lean_error"])
+
+
+def proof_probe(args, default_repo):
+    search_repo = repo_arg(args, default_repo)
+    run_args = {}
+    if args.get("run_project"):
+        run_args["project"] = args.get("run_project")
+    if args.get("run_repo_path"):
+        run_args["repo_path"] = args.get("run_repo_path")
+    run_repo = repo_arg(run_args, default_repo) if run_args else default_repo
+    imports = normalize_imports(args.get("imports"))
+    checks = as_list(args.get("checks") or args.get("check") or args.get("qualified_name") or args.get("name"))
+    ensure_index(search_repo); con = connect(search_repo)
+    suggested = []
+    for q in checks:
+        r, _ = lookup_decl(con, q)
+        if r is not None:
+            suggested.append(import_for_file(r["file"]))
+    con.close()
+    imports = normalize_imports(imports + suggested)
+    lines = [f"import {imp}" for imp in imports]
+    lines.extend(["set_option maxHeartbeats 400000", "set_option pp.universes true", "set_option pp.all true"])
+    for q in checks:
+        lines.append(f"#check {q}")
+    if args.get("code"):
+        lines.append(str(args["code"]))
+    if args.get("goal"):
+        proof = str(args.get("proof") or "by\n  sorry")
+        lines.append(f"example : {args['goal']} := {proof}")
+    if args.get("example"):
+        lines.append(str(args["example"]))
+    probe_dir = index_root() / "probes" / project_name(run_repo)
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    probe_file = probe_dir / f"Probe_{int(time.time() * 1000)}.lean"
+    probe_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    cmd = ["lake", "env", "lean", str(probe_file)]
+    timeout = int(args.get("timeout_sec") or 60)
+    try:
+        proc = subprocess.run(cmd, cwd=str(run_repo), text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=timeout)
+        output = (proc.stdout or "") + (proc.stderr or "")
+        return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "run_repo": str(run_repo), "probe_file": str(probe_file), "imports": imports, "checks": checks, "command": " ".join(cmd), "diagnosis": diagnose_lean_output(output), "stdout": proc.stdout, "stderr": proc.stderr}
+    except subprocess.TimeoutExpired as exc:
+        return {"ok": False, "exit_code": None, "run_repo": str(run_repo), "probe_file": str(probe_file), "imports": imports, "checks": checks, "command": " ".join(cmd), "diagnosis": ["timeout"], "stdout": exc.stdout, "stderr": exc.stderr}
+
+
+def configured_repos(default_repo, names=None):
+    repos, seen = [], set()
+    for name in (names or DEFAULT_CROSS_PROJECTS):
+        repo = alias_repo(name) or (default_repo if name == "default" else None)
+        if repo and repo.exists() and str(repo).lower() not in seen:
+            seen.add(str(repo).lower()); repos.append((name, repo))
+    return repos
+
+
+def cross_repo_lookup(args, default_repo):
+    q = str(args.get("query") or args.get("name") or args.get("qualified_name") or "")
+    short = q.split(".")[-1]
+    projects = as_list(args.get("projects")) or DEFAULT_CROSS_PROJECTS
+    limit = int(args.get("limit") or 20)
+    out = {"query": q, "projects": []}
+    for label, repo in configured_repos(default_repo, projects):
+        item = {"project": label, "repo_path": str(repo), "indexed": db_path(repo).exists()}
+        if not item["indexed"]:
+            out["projects"].append(item); continue
+        con = connect(repo)
+        decls = [dict(x) for x in con.execute("SELECT qn qualified_name,name,kind,file file_path,start_line FROM decls WHERE qn=? OR name=? OR qn LIKE ? OR name LIKE ? ORDER BY length(qn) LIMIT ?", (q, q, f"%{q}%", f"%{q}%", limit))]
+        users = [dict(x) for x in con.execute("SELECT qn qualified_name,name,kind,file file_path,start_line FROM decls WHERE src LIKE ? AND qn NOT LIKE ? ORDER BY file,start_line LIMIT ?", (f"%{short}%", f"%{q}%", limit))] if short else []
+        item.update({"declarations": decls, "users": users})
+        con.close(); out["projects"].append(item)
+    provider_hits = [p for p in out["projects"] if p["project"] == "provider" and p.get("declarations")]
+    main_hits = [p for p in out["projects"] if p["project"] in {"highdimprob", "main"} and p.get("declarations")]
+    out["migration_hint"] = "same-name declaration appears in provider and HighDimProb" if provider_hits and main_hits else "no same-name provider/main pair found"
+    return out
+
+
+def consumer_fit(args, default_repo):
+    repo = repo_arg({"project": args.get("project") or "provider"}, default_repo)
+    ensure_index(repo); con = connect(repo)
+    q = str(args.get("consumer") or args.get("qualified_name") or args.get("name") or "")
+    r, rows = lookup_decl(con, q)
+    if r is None:
+        con.close(); return {"found": False, "ambiguous": bool(rows), "suggestions": [dict(x) for x in rows]}
+    target = theorem_card(repo, con, r, False)
+    obligations = [target.get("conclusion", "")] + target.get("premises", [])
+    source_terms = shape_terms(r["src"] or r["stmt"] or "")
+    con.close()
+    projects = as_list(args.get("projects")) or DEFAULT_CROSS_PROJECTS
+    per_obligation = []
+    for obl in obligations[:int(args.get("max_obligations") or 8)]:
+        if not str(obl).strip():
+            continue
+        qterms = shape_terms(obl)
+        candidates = []
+        for label, cand_repo in configured_repos(default_repo, projects):
+            if not db_path(cand_repo).exists():
+                continue
+            ccon = connect(cand_repo)
+            scored = []
+            for cr in ccon.execute("SELECT * FROM decls WHERE kind IN ('theorem','lemma','abbrev')"):
+                if cr["qn"] == target["qualified_name"]:
+                    continue
+                score, overlap, _ = shape_score(qterms, cr, False)
+                if score > 0:
+                    scored.append((score, overlap, cr))
+            scored.sort(key=lambda x: -x[0])
+            for score, overlap, cr in scored[:3]:
+                item = theorem_result(cr); item["project"] = label; item["shape_score"] = score; item["matched_shape_terms"] = overlap; item["import"] = import_for_file(cr["file"])
+                candidates.append(item)
+            ccon.close()
+        candidates.sort(key=lambda x: -x["shape_score"])
+        per_obligation.append({"obligation_shape": obl, "candidates": candidates[:int(args.get("candidates_per_obligation") or 6)]})
+    return {"found": True, "consumer": target, "source_shape_terms": source_terms[:60], "obligation_candidates": per_obligation, "note": "Heuristic consumer-fit: matches premise/conclusion shape; run proof_probe for elaboration."}
+
+def project_templates(args):
+    return {"topics": TOPIC_PATHS, "search_templates": [
+        {"name": "Matrix.IsHermitian.cfc", "project": "mathlib", "topic": "Matrix", "shape": "Matrix.trace (cfc f A) = _"},
+        {"name": "trace cfc finite expansion", "project": "mathlib", "shape": "Matrix.trace (cfc f A) = ∑ i, _"},
+        {"name": "CFC.log bridge", "project": "mathlib", "topic": "CFC", "shape": "cfc Real.log A = _"},
+        {"name": "resolvent inverse affine line", "project": "mathlib", "shape": "HasDerivAt (fun t => (A + t • C)⁻¹) _ _"},
+        {"name": "interval integral shift/cutoff", "project": "mathlib", "topic": "IntervalIntegral", "shape": "∫ x in a..b, f (x + c) = _"},
+        {"name": "scalar integral inv positive", "project": "mathlib", "topic": "SpecialFunctions", "shape": "∫ x, (x + a)⁻¹ = Real.log _"}
+    ], "probe_template": {"run_project": "provider", "project": "mathlib", "checks": ["Matrix.IsHermitian.eigenvalues_mem_spectrum_real"]}}
+
 TOOLS = {
- "index_repository": ("Incrementally index a Lean repository into local SQLite FTS. Use mode='full' to rebuild.", {"type":"object","properties":{"repo_path":{"type":"string"},"project":{"type":"string"},"mode":{"type":"string"}}}),
- "index_status": ("Return local Lean index status, staleness, and cache size.", {"type":"object","properties":{"repo_path":{"type":"string"},"project":{"type":"string"}}}),
+ "index_repository": ("Incrementally/resumably index a Lean repository. Supports background=true, mode=resume, topic/path_prefix/path_filter/file_pattern, and batch_size.", {"type":"object","properties":{"repo_path":{"type":"string"},"project":{"type":"string"},"mode":{"type":"string"},"background":{"type":"boolean"},"resume":{"type":"boolean"},"topic":{"type":"string"},"topics":{"type":"array","items":{"type":"string"}},"path_prefix":{"type":"string"},"paths":{"type":"array","items":{"type":"string"}},"path_filter":{"type":"string"},"file_pattern":{"type":"string"},"batch_size":{"type":"integer"}}}),
+ "index_status": ("Return local Lean index status, progress, staleness, cache size, and optional scoped file details.", {"type":"object","properties":{"repo_path":{"type":"string"},"project":{"type":"string"},"details":{"type":"boolean"},"topic":{"type":"string"},"path_prefix":{"type":"string"},"path_filter":{"type":"string"},"file_pattern":{"type":"string"},"detail_limit":{"type":"integer"}}}),
  "cache_status": ("List cache databases or inspect one project's cache status.", {"type":"object","properties":{"repo_path":{"type":"string"},"project":{"type":"string"}}}),
  "remove_project": ("Delete one indexed project cache database. Requires project or repo_path unless allow_default is true.", {"type":"object","properties":{"repo_path":{"type":"string"},"project":{"type":"string"},"allow_default":{"type":"boolean"}}}),
  "list_projects": ("List configured local Lean projects.", {"type":"object","properties":{}}),
+ "index_visibility": ("Report tracked/untracked indexed files, stale files, and root-import exposure.", {"type":"object","properties":{"repo_path":{"type":"string"},"project":{"type":"string"},"details":{"type":"boolean"},"root":{"type":"string"},"roots":{"type":"array","items":{"type":"string"}},"topic":{"type":"string"},"path_prefix":{"type":"string"},"detail_limit":{"type":"integer"}}}),
+ "search_shape": ("Search theorem-like declarations by syntactic type-shape overlap, e.g. Matrix.trace (cfc f A) = _ or HasDerivAt inverse affine-line shapes.", {"type":"object","properties":{"shape":{"type":"string"},"query":{"type":"string"},"type":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"min_score":{"type":"integer"},"cards":{"type":"boolean"},"include_source":{"type":"boolean"},"repo_path":{"type":"string"},"project":{"type":"string"},"topic":{"type":"string"},"path_prefix":{"type":"string"},"path_filter":{"type":"string"},"file_pattern":{"type":"string"}}}),
+ "theorem_card": ("Return a rich theorem card: statement, import, location, namespace, typeclass hints, and minimal #check.", {"type":"object","properties":{"qualified_name":{"type":"string"},"name":{"type":"string"},"include_source":{"type":"boolean"},"repo_path":{"type":"string"},"project":{"type":"string"}}}),
+ "proof_probe": ("Generate a temporary Lean file and run lake env lean for #check/example probes; reports import/name/typeclass/type mismatch diagnostics.", {"type":"object","properties":{"project":{"type":"string"},"repo_path":{"type":"string"},"run_project":{"type":"string"},"run_repo_path":{"type":"string"},"imports":{"type":"array","items":{"type":"string"}},"checks":{"type":"array","items":{"type":"string"}},"check":{"type":"string"},"qualified_name":{"type":"string"},"name":{"type":"string"},"goal":{"type":"string"},"proof":{"type":"string"},"example":{"type":"string"},"code":{"type":"string"},"timeout_sec":{"type":"integer"}}}),
+ "consumer_fit": ("Heuristically match a consumer theorem premise/conclusion shape against provider/HighDimProb/Mathlib candidate leaf theorems.", {"type":"object","properties":{"consumer":{"type":"string"},"qualified_name":{"type":"string"},"name":{"type":"string"},"project":{"type":"string"},"projects":{"type":"array","items":{"type":"string"}},"max_obligations":{"type":"integer"},"candidates_per_obligation":{"type":"integer"}}}),
+ "cross_repo_lookup": ("Search provider/HighDimProb/Mathlib for same-name declarations and textual users.", {"type":"object","properties":{"query":{"type":"string"},"name":{"type":"string"},"qualified_name":{"type":"string"},"projects":{"type":"array","items":{"type":"string"}},"limit":{"type":"integer"}}}),
+ "project_templates": ("Return HighDimProb/LiebProvider-specific search and proof-probe templates.", {"type":"object","properties":{}}),
  "search_graph": ("Search Lean declarations by FTS query, name_pattern, qn_pattern, file_pattern, or label.", {"type":"object","properties":{"query":{"type":"string"},"name_pattern":{"type":"string"},"qn_pattern":{"type":"string"},"file_pattern":{"type":"string"},"label":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"repo_path":{"type":"string"},"project":{"type":"string"}}}),
- "search_theorems": ("Lean-aware theorem-like search over theorem/lemma/abbrev names, conclusions, premises, and head symbols.", {"type":"object","properties":{"query":{"type":"string"},"conclusion":{"type":"string"},"premise":{"type":"string"},"symbol":{"type":"string"},"name_pattern":{"type":"string"},"qn_pattern":{"type":"string"},"file_pattern":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"repo_path":{"type":"string"},"project":{"type":"string"}}}),
+ "search_theorems": ("Lean-aware theorem-like search over theorem/lemma/abbrev names, conclusions, premises, and head symbols. Pass cards=true for rich theorem cards; topic/path filters are supported.", {"type":"object","properties":{"query":{"type":"string"},"conclusion":{"type":"string"},"premise":{"type":"string"},"symbol":{"type":"string"},"name_pattern":{"type":"string"},"qn_pattern":{"type":"string"},"file_pattern":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"repo_path":{"type":"string"},"project":{"type":"string"},"topic":{"type":"string"},"path_prefix":{"type":"string"},"path_filter":{"type":"string"},"cards":{"type":"boolean"},"include_source":{"type":"boolean"}}}),
  "search_code": ("Search raw Lean source and return declaration-aware hits.", {"type":"object","properties":{"pattern":{"type":"string"},"query":{"type":"string"},"regex":{"type":"boolean"},"file_pattern":{"type":"string"},"path_filter":{"type":"string"},"mode":{"type":"string"},"context":{"type":"integer"},"limit":{"type":"integer"},"repo_path":{"type":"string"},"project":{"type":"string"}}}),
  "get_code_snippet": ("Read source for an indexed Lean declaration.", {"type":"object","properties":{"qualified_name":{"type":"string"},"name":{"type":"string"},"include_neighbors":{"type":"boolean"},"repo_path":{"type":"string"},"project":{"type":"string"}}}),
  "get_context": ("Return proof-oriented Lean context for one declaration: imports, local variables, theorem profile, neighbors, and source context.", {"type":"object","properties":{"qualified_name":{"type":"string"},"name":{"type":"string"},"before":{"type":"integer"},"after":{"type":"integer"},"neighbor_radius":{"type":"integer"},"repo_path":{"type":"string"},"project":{"type":"string"}}}),
@@ -815,11 +1372,18 @@ def call_tool(name, args, default_repo):
     if name == "list_projects": return {"projects": indexed_projects(default_repo)}
     if name == "cache_status": return cache_status(args, default_repo)
     if name == "remove_project": return remove_project(args, default_repo)
+    if name == "proof_probe": return proof_probe(args, default_repo)
+    if name == "project_templates": return project_templates(args)
+    if name == "consumer_fit": return consumer_fit(args, default_repo)
+    if name == "cross_repo_lookup": return cross_repo_lookup(args, default_repo)
     repo = repo_arg(args, default_repo)
     if name == "index_repository": return index_repository(args, repo)
     if name == "index_status": return index_status(args, repo)
+    if name == "index_visibility": return index_visibility(args, repo)
     if name == "search_graph": return search_graph(args, repo)
     if name == "search_theorems": return search_theorems(args, repo)
+    if name == "search_shape": return search_shape(args, repo)
+    if name == "theorem_card": return theorem_card_tool(args, repo)
     if name == "search_code": return search_code(args, repo)
     if name == "get_code_snippet": return get_code_snippet(args, repo)
     if name == "get_context": return get_context(args, repo)
@@ -866,7 +1430,9 @@ def main():
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--search")
+    ap.add_argument("--index-args")
     ns = ap.parse_args(); repo = Path(ns.repo).resolve()
+    if ns.index_args: print(json.dumps(index_repository(json.loads(ns.index_args), repo), ensure_ascii=False, indent=2)); return 0
     if ns.index: print(json.dumps(index_repository({"mode":"full" if ns.full else "incremental"}, repo), ensure_ascii=False, indent=2)); return 0
     if ns.status: print(json.dumps(index_status({}, repo), ensure_ascii=False, indent=2)); return 0
     if ns.search: print(json.dumps(search_graph({"query":ns.search}, repo), ensure_ascii=False, indent=2)); return 0
