@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.py[cod]
+.lean-local-search/
+.tmp/
+.DS_Store
