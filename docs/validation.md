@@ -97,6 +97,17 @@ Validated fuzz runner:
 python tools/fuzz_mcp.py --iterations 300 --seed 1700001: failures=[]
 python tools/fuzz_mcp.py --iterations 80 --seed 1700002 --include-existing: failures=[]
 ```
+
+Validated scanner-first parser refactor:
+
+```text
+internal imports / namespace / end / identifiers / typeclass brackets now use small scanners
+remaining regex use is limited to tree-sitter-unavailable declaration fallback and explicit user pattern APIs
+python -m py_compile tools/lean_local_search_mcp.py tools/fuzz_mcp.py: ok
+python tools/fuzz_mcp.py --iterations 500 --seed 1700101: failures=[]
+python tools/fuzz_mcp.py --iterations 120 --seed 1700102 --include-existing: failures=[]
+protocol checks: theorem_card, search_shape, proof_probe, index_visibility all returned ok-shaped results
+```
 ## Bugs Fixed During Validation
 
 - `remove_project` initially failed on Windows because the same MCP process still held an open SQLite connection after indexing. Index/status/project lookup code now closes SQLite connections before returning.

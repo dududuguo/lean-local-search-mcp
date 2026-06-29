@@ -30,13 +30,134 @@ TOPIC_PATHS = {
 }
 DEFAULT_CROSS_PROJECTS = ["provider", "highdimprob", "mathlib"]
 DECL_RE = re.compile(r"(?m)^\s*(?:@[^\n]*\n\s*)*(?:private\s+|protected\s+|noncomputable\s+|unsafe\s+|partial\s+)*(theorem|lemma|def|abbrev|instance|structure|class|inductive|axiom|opaque|constant|example)\b\s*([^\s:(\[{]+)?")
-IMPORT_RE = re.compile(r"(?m)^\s*import\s+(.+?)\s*$")
-NS_RE = re.compile(r"^\s*namespace\s+([A-Za-z0-9_.'`]+)\s*$")
-END_RE = re.compile(r"^\s*end(?:\s+[A-Za-z0-9_.'`]+)?\s*$")
-IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_'.]*\b")
 
 def log(msg):
     print(f"[{SERVER_NAME}] {msg}", file=sys.stderr, flush=True)
+
+
+def lean_ident_char(ch, first=False):
+    return ch == "_" or ch.isalpha() or (not first and (ch.isdigit() or ch in ".'`"))
+
+
+def lean_identifiers(text):
+    text = str(text or "")
+    out = []
+    i = 0
+    while i < len(text):
+        if not lean_ident_char(text[i], first=True):
+            i += 1
+            continue
+        j = i + 1
+        while j < len(text) and lean_ident_char(text[j]):
+            j += 1
+        token = text[i:j].strip(".")
+        if token:
+            out.append(token)
+        i = j
+    return out
+
+
+def split_decl_names(raw_names):
+    return [name for name in raw_names.replace(",", " ").split() if name and name != "_"]
+
+
+def import_modules(content):
+    modules = []
+    for line in str(content or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("import "):
+            modules.extend(part for part in stripped[len("import "):].split() if part)
+    return modules
+
+
+def namespace_line(line):
+    stripped = line.strip()
+    if not stripped.startswith("namespace "):
+        return ""
+    rest = stripped[len("namespace "):].strip()
+    return rest.split()[0] if rest else ""
+
+
+def is_end_line(line):
+    stripped = line.strip()
+    return stripped == "end" or stripped.startswith("end ")
+
+
+DECL_MODIFIERS = {"private", "protected", "noncomputable", "unsafe", "partial"}
+
+
+def decl_kind_name_from_header(src, fallback_kind, fallback_name):
+    for line in str(src or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("@["):
+            continue
+        tokens = stripped.replace("(", " ").replace("{", " ").replace("[", " ").split()
+        for i, tok in enumerate(tokens):
+            if tok in DECL_MODIFIERS:
+                continue
+            if tok in KINDS:
+                name = fallback_name or "_anonymous"
+                if tok != "example" and i + 1 < len(tokens):
+                    candidate = tokens[i + 1].strip()
+                    if candidate and candidate[0] not in ":=({[":
+                        name = candidate
+                return tok, name
+    return fallback_kind, fallback_name or "_anonymous"
+
+
+def declaration_signature_rest(stmt, kind, name):
+    stmt = str(stmt or "")
+    lines = stmt.splitlines()
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("@["):
+            continue
+        tokens = stripped.split()
+        if kind not in tokens:
+            return stmt.strip()
+        kind_pos = line.find(kind)
+        if kind_pos < 0:
+            return stmt.strip()
+        after = line[kind_pos + len(kind):]
+        if name and name != "_anonymous":
+            stripped_after = after.lstrip()
+            if stripped_after.startswith(name):
+                after = stripped_after[len(name):]
+        rest_lines = [after.strip()]
+        rest_lines.extend(lines[idx + 1:])
+        return "\n".join(rest_lines).strip()
+    return stmt.strip()
+
+
+def bracket_groups(text, opener="[", closer="]", limit=20):
+    groups = []
+    depth = 0
+    start = None
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(str(text or "")):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == opener:
+            if depth == 0:
+                start = i + 1
+            depth += 1
+        elif ch == closer and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                groups.append(text[start:i].strip())
+                if len(groups) >= limit:
+                    break
+    return groups
 
 def local_mathlib_roots():
     base = SERVER_REPO.parent
@@ -264,10 +385,11 @@ def line_of(data, byte):
 def namespace_at(lines, line_no):
     stack = []
     for line in lines[:max(0, line_no - 1)]:
-        m = NS_RE.match(line)
-        if m:
-            stack.append(m.group(1)); continue
-        if END_RE.match(line) and stack:
+        ns = namespace_line(line)
+        if ns:
+            stack.append(ns)
+            continue
+        if is_end_line(line) and stack:
             stack.pop()
     return ".".join(stack)
 
@@ -324,9 +446,8 @@ def split_decl(src):
         return (src[:pos].strip(), src[pos + len(tok):].strip()) if tok != " where" else (src[:pos].strip(), src[pos:].strip())
     return src.strip(), ""
 
-def regex_kind_name(src, fallback_kind, fallback_name):
-    m = DECL_RE.search(src)
-    return (m.group(1), m.group(2) or fallback_name or "_anonymous") if m else (fallback_kind, fallback_name)
+def decl_kind_name(src, fallback_kind, fallback_name):
+    return decl_kind_name_from_header(src, fallback_kind, fallback_name)
 
 def ts_decls(data):
     try:
@@ -428,7 +549,7 @@ def top_level_binder_groups(s):
 
 def symbol_list(text, limit=80):
     seen, out = set(), []
-    for ident in IDENT_RE.findall(text or ""):
+    for ident in lean_identifiers(text):
         short = ident.split(".")[-1]
         if ident in STOP_SYMBOLS or short in STOP_SYMBOLS:
             continue
@@ -455,8 +576,7 @@ def looks_like_premise(names, typ):
 def analyze_statement(kind, name, stmt):
     if kind not in KINDS:
         return {"signature": "", "binders": [], "premises": [], "conclusion": "", "head_symbols": []}
-    m = DECL_RE.search(stmt or "")
-    rest = (stmt[m.end():] if m else stmt or "").strip()
+    rest = declaration_signature_rest(stmt, kind, name)
     colon = find_top_level_colon(rest)
     if colon >= 0:
         left, conclusion = rest[:colon].strip(), rest[colon + 1:].strip()
@@ -470,7 +590,7 @@ def analyze_statement(kind, name, stmt):
             continue
         raw_names = text[:split].strip()
         typ = text[split + 1:].strip()
-        names = [n for n in re.split(r"[\s,]+", raw_names) if n and n != "_"]
+        names = split_decl_names(raw_names)
         item = {"names": names, "type": typ, "bracket": group["bracket"]}
         binders.append(item)
         if looks_like_premise(names, typ):
@@ -485,7 +605,7 @@ def extract_file(repo, path):
     decls, seen = [], set()
     for item in raw:
         src = data[item["start"]:item["end"]].decode("utf-8", "replace").strip()
-        kind, name = regex_kind_name(src, item["kind"], item["name"])
+        kind, name = decl_kind_name(src, item["kind"], item["name"])
         if kind not in KINDS:
             continue
         start_line = line_of(data, item["start"])
@@ -554,7 +674,7 @@ def total_imports(con):
     nimports = 0
     for r in con.execute("SELECT path, content FROM files"):
         if str(r["path"]).endswith(".lean"):
-            nimports += sum(1 for _ in IMPORT_RE.finditer(r["content"]))
+            nimports += len(import_modules(r["content"]))
     return nimports
 
 def stale_summary(repo, con, args=None, details=False):
@@ -698,7 +818,7 @@ def header_lines_before(con, r, limit=40):
 def key_typeclasses(stmt, header_lines):
     text = "\n".join([stmt or ""] + [h.get("text", "") for h in header_lines])
     seen, out = set(), []
-    for item in re.findall(r"\[[^\[\]\n]+\]", text):
+    for item in bracket_groups(text):
         clean = " ".join(item.strip("[]").split())
         if clean and clean not in seen:
             seen.add(clean); out.append(clean)
@@ -724,12 +844,14 @@ def theorem_card(repo, con, r, include_source=False):
     if include_source:
         card["source"] = r["src"]
     return card
+
+
 def fts(q):
-    toks = re.findall(r"[A-Za-z0-9_'.]+", str(q))
+    toks = lean_identifiers(q)
     return " OR ".join(f'"{t}"' for t in toks) if toks else str(q).replace('"', '""')
 
 def query_tokens(value):
-    return [t.lower() for t in re.findall(r"[A-Za-z0-9_'.]+", str(value or ""))]
+    return [t.lower() for t in lean_identifiers(value)]
 
 
 def contains_all(text, toks):
@@ -838,7 +960,7 @@ def shape_terms(text):
     for needle, token in SHAPE_OPS:
         if needle in text:
             terms.append(token.lower())
-    for ident in IDENT_RE.findall(text):
+    for ident in lean_identifiers(text):
         short = ident.split(".")[-1]
         if ident in SHAPE_STOP or short in SHAPE_STOP:
             continue
@@ -1007,7 +1129,7 @@ def get_context(args, repo):
     radius = int(args["neighbor_radius"]) if args.get("neighbor_radius") is not None else 5
     a, b = max(1, r["start_line"] - before), min(len(lines), r["end_line"] + after)
     source_context = "\n".join(f"{n}: {lines[n - 1]}" for n in range(a, b + 1)) if lines else ""
-    imports = [m.group(1) for m in IMPORT_RE.finditer(fr["content"] if fr else "")]
+    imports = import_modules(fr["content"] if fr else "")
     header_lines = []
     for i, line in enumerate(lines[:max(0, r["start_line"] - 1)], 1):
         stripped = line.strip()
@@ -1024,7 +1146,7 @@ def get_architecture(args, repo):
     for r in con.execute("SELECT path, content FROM files"):
         if not str(r["path"]).endswith(".lean"):
             continue
-        for m in IMPORT_RE.finditer(r["content"]): imports.update(m.group(1).split())
+        imports.update(import_modules(r["content"]))
     return {"project": project_name(repo), "repo_path": str(repo), "db_path": str(db_path(repo)), "files": files, "declarations": decls, "kinds": kinds, "imports": sorted(imports)}
 
 def index_status(args, repo):
@@ -1085,8 +1207,7 @@ def root_import_visibility(repo, con, args=None):
     graph = {}
     for path, body in content.items():
         deps = []
-        for m in IMPORT_RE.finditer(body or ""):
-            for mod in m.group(1).split():
+        for mod in import_modules(body or ""):
                 rel = module_to_file.get(mod)
                 if rel:
                     deps.append(rel)
@@ -1176,7 +1297,7 @@ def trace_path(args, repo):
     if direction in {"inbound","both"}:
         inbound = [row_result(r) for r in con.execute("SELECT * FROM decls WHERE id!=? AND src LIKE ? LIMIT 100", (d["id"], f"%{d['name']}%"))]
     if direction in {"outbound","both"}:
-        names = {x.split(".")[-1] for x in IDENT_RE.findall(d["src"])}
+        names = {x.split(".")[-1] for x in lean_identifiers(d["src"])}
         if names:
             qs = ",".join("?" for _ in names)
             outbound = [row_result(r) for r in con.execute(f"SELECT * FROM decls WHERE name IN ({qs}) LIMIT 100", tuple(names)) if r["id"] != d["id"]]
