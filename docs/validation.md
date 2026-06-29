@@ -6,22 +6,22 @@ This repository was split out from the first MVP inside `HighDimProbLiebProvider
 
 | Target | Mode | Indexed files | Lean declarations | Imports | Notes |
 | --- | --- | ---: | ---: | ---: | --- |
-| `C:\Users\11388\reserach\HighDimProbLiebProvider` | full | 258 | 513 | 341 | Provider repo indexed with tree-sitter in the standalone venv. |
-| `C:\Users\11388\reserach\HighDimProbLiebProvider` | incremental | 258 | 513 | 341 | No-op reindex reported `changed_files: 0`, `skipped_files: 258`. |
-| `C:\Users\11388\reserach\HighDimProb` | full | 712 | 2144 | 747 | Full main project indexed. Do not use only `HighDimProb\docs` when looking for Lean declarations. |
-| `C:\Users\11388\reserach\HighDimProb` | incremental | 712 | 2144 | 747 | No-op reindex reported `changed_files: 0`, `skipped_files: 712`. |
-| `C:\Users\11388\reserach\HighDimProbLiebProvider\.lake\packages\mathlib` | full | 8407 | 209309 | 1787 | Provider Mathlib checkout indexed through the `mathlib` alias. |
-| `C:\Users\11388\reserach\HighDimProbLiebProvider\.lake\packages\mathlib` | incremental | 8407 | 209309 | 1787 | No-op reindex reported `changed_files: 0`, `skipped_files: 8407`. |
+| `<provider-repo>` | full | 258 | 513 | 341 | Provider repo indexed with tree-sitter in the standalone venv. |
+| `<provider-repo>` | incremental | 258 | 513 | 341 | No-op reindex reported `changed_files: 0`, `skipped_files: 258`. |
+| `<main-repo>` | full | 712 | 2144 | 747 | Full main project indexed. Do not use only `HighDimProb\docs` when looking for Lean declarations. |
+| `<main-repo>` | incremental | 712 | 2144 | 747 | No-op reindex reported `changed_files: 0`, `skipped_files: 712`. |
+| `<mathlib-repo>` | full | 8407 | 209309 | 1787 | Provider Mathlib checkout indexed through the `mathlib` alias. |
+| `<mathlib-repo>` | incremental | 8407 | 209309 | 1787 | No-op reindex reported `changed_files: 0`, `skipped_files: 8407`. |
 
 ## MCP Protocol Checks
 
 Validated `tools/list` exposes short aliases without duplicate project entries:
 
 ```text
-provider, HighDimProbLiebProvider -> C:\Users\11388\reserach\HighDimProbLiebProvider
-highdimprob, HighDimProb, main -> C:\Users\11388\reserach\HighDimProb
-mathlib, Mathlib, provider-mathlib -> C:\Users\11388\reserach\HighDimProbLiebProvider\.lake\packages\mathlib
-highdimprob-mathlib -> C:\Users\11388\reserach\HighDimProb\.lake\packages\mathlib
+provider, HighDimProbLiebProvider -> <provider-repo>
+highdimprob, HighDimProb, main -> <main-repo>
+mathlib, Mathlib, provider-mathlib -> <mathlib-repo>
+highdimprob-mathlib -> <main-mathlib-repo>
 ```
 
 Validated `tools/list` exposes these post-MVP tools:
@@ -34,7 +34,7 @@ Validated `tools/list` exposes these post-MVP tools:
 Validated theorem search:
 
 ```text
-project: C-Users-11388-reserach-HighDimProb
+project: <main-project-cache-key>
 query: Matrix Bernstein
 limit: 1
 first theorem: HighDimProb.matrixBernsteinTraceMGFWithBernsteinCoeff_negRandomMatrixFamily
@@ -44,7 +44,7 @@ total theorem-like matches: 964
 Validated `get_context`:
 
 ```text
-project: C-Users-11388-reserach-HighDimProb
+project: <main-project-cache-key>
 qualified_name: HighDimProb.matrixBernsteinTraceMGF_under_tropp
 conclusion: matrixBernsteinTraceMGFWithBernsteinCoeff_statement P A theta R
 includes: imports, local_header, theorem_profile, neighbors, source, source_context
@@ -64,7 +64,7 @@ get_context includes: local_header, theorem_profile, neighbors, source, source_c
 Validated cache removal in the same MCP process:
 
 ```text
-repo_path: C:\tmp\lean-local-search-mcp-cache-test
+repo_path: <temp-cache-repo>
 index_repository: declarations=1
 remove_project: removed=true
 ```
@@ -72,7 +72,7 @@ remove_project: removed=true
 Validated cache status:
 
 ```text
-project: C-Users-11388-reserach-HighDimProb
+project: <main-project-cache-key>
 schema_version: 2
 status: ready
 is_stale: false

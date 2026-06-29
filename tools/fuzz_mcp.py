@@ -55,6 +55,17 @@ lemma has_deriv_shape (f : Real -> Real) (x y : Real) : HasDerivAt f y x -> HasD
   intro h
   exact h
 
+namespace Nested
+
+section DecidableEq
+variable [DecidableEq Nat]
+end DecidableEq
+
+theorem nested_after_section (n : Nat) : n = n := by
+  rfl
+
+end Nested
+
 end Fuzz
 """,
     )
@@ -179,6 +190,12 @@ def main() -> int:
         make_repo(temp_root)
         initial = mod.index_repository({"mode": "full", "batch_size": 5}, temp_root)
         assert_jsonable(initial)
+        con = mod.connect(temp_root)
+        try:
+            nested = con.execute("SELECT qn FROM decls WHERE name=?", ("nested_after_section",)).fetchone()
+            assert nested is not None and nested["qn"] == "Fuzz.Nested.nested_after_section", nested["qn"] if nested else None
+        finally:
+            con.close()
         for i in range(args.iterations):
             existing = args.include_existing and rng.random() < 0.25
             tool = rng.choice([t for t in tools if existing or t != "index_repository"])

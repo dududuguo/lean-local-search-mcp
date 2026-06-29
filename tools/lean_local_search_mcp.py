@@ -70,18 +70,35 @@ def import_modules(content):
     return modules
 
 
-def namespace_line(line):
+def scoped_keyword_name(line, keyword, allow_unnamed=False):
     stripped = line.strip()
-    if not stripped.startswith("namespace "):
-        return ""
-    rest = stripped[len("namespace "):].strip()
-    return rest.split()[0] if rest else ""
+    if not stripped or stripped.startswith("--"):
+        return None
+    if stripped == keyword:
+        return "" if allow_unnamed else None
+    prefix = keyword + " "
+    if not stripped.startswith(prefix):
+        return None
+    rest = stripped[len(prefix):].strip()
+    if not rest or rest.startswith("--"):
+        return "" if allow_unnamed else None
+    return rest.split()[0]
+
+
+def namespace_line(line):
+    return scoped_keyword_name(line, "namespace") or ""
+
+
+def section_line(line):
+    return scoped_keyword_name(line, "section", allow_unnamed=True)
+
+
+def end_line_name(line):
+    return scoped_keyword_name(line, "end", allow_unnamed=True)
 
 
 def is_end_line(line):
-    stripped = line.strip()
-    return stripped == "end" or stripped.startswith("end ")
-
+    return end_line_name(line) is not None
 
 DECL_MODIFIERS = {"private", "protected", "noncomputable", "unsafe", "partial"}
 
@@ -382,16 +399,35 @@ def lean_files(repo):
 def line_of(data, byte):
     return data[:max(0, byte)].count(b"\n") + 1
 
+def close_scope(stack, name):
+    if not stack:
+        return
+    if name:
+        for idx in range(len(stack) - 1, -1, -1):
+            scope_name = stack[idx][1]
+            if scope_name == name or scope_name.split(".")[-1] == name:
+                del stack[idx:]
+                return
+        return
+    stack.pop()
+
+
 def namespace_at(lines, line_no):
     stack = []
     for line in lines[:max(0, line_no - 1)]:
         ns = namespace_line(line)
         if ns:
-            stack.append(ns)
+            stack.append(("namespace", ns))
             continue
-        if is_end_line(line) and stack:
-            stack.pop()
-    return ".".join(stack)
+        section = section_line(line)
+        if section is not None:
+            stack.append(("section", section))
+            continue
+        ended = end_line_name(line)
+        if ended is not None:
+            close_scope(stack, ended)
+    names = [name for kind, name in stack if kind == "namespace" and name and name != "_root_"]
+    return ".".join(names)
 
 def doc_before(lines, start_line):
     i, got, in_block = start_line - 2, [], False
@@ -846,6 +882,95 @@ def theorem_card(repo, con, r, include_source=False):
     return card
 
 
+SUGGEST_COLUMNS = "qn qualified_name,name,kind,file file_path,start_line"
+
+
+def compact_decl_key(value):
+    return "".join(ch.lower() for ch in str(value or "") if ch.isalnum())
+
+
+def decl_suggestions(con, q, limit=10, kinds=None):
+    q = str(q or "").strip()
+    if not q:
+        return []
+    limit = max(1, int(limit or 10))
+    kinds = tuple(kinds or [])
+    kind_clause = ""
+    kind_params = ()
+    if kinds:
+        kind_clause = " AND kind IN (" + ",".join("?" for _ in kinds) + ")"
+        kind_params = kinds
+    seen = set()
+    ranked = []
+
+    def add(rows, score, reason):
+        for row in rows:
+            item = dict(row)
+            key = item.get("qualified_name") or item.get("qn")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            item["suggestion_reason"] = reason
+            item["suggestion_score"] = score
+            ranked.append(item)
+
+    def fetch(where, params, score, reason, order="length(qn), file, start_line", cap=None):
+        sql = f"SELECT {SUGGEST_COLUMNS} FROM decls WHERE {where}{kind_clause} ORDER BY {order} LIMIT ?"
+        rows = con.execute(sql, tuple(params) + kind_params + (cap or limit,)).fetchall()
+        add(rows, score, reason)
+
+    leaf = q.split(".")[-1]
+    leaf_compact = compact_decl_key(leaf)
+
+    fetch("qn=? OR name=?", (q, q), 1200, "exact_qn_or_name")
+    if len(ranked) < limit and leaf and leaf != q:
+        fetch("name=?", (leaf,), 1050, "same_leaf_name")
+    if len(ranked) < limit and leaf and leaf != q:
+        fetch("qn LIKE ?", (f"%.{leaf}",), 950, "same_qn_suffix")
+    if len(ranked) < limit and leaf_compact:
+        parts = [p for p in leaf.replace("'", "_").split("_") if len(p) > 2]
+        if parts:
+            placeholders = ",".join("?" for _ in parts)
+            fetch(f"name IN ({placeholders})", tuple(parts), 650, "name_part_index", cap=max(limit, len(parts) * 3))
+
+    if len(ranked) < limit:
+        toks = lean_identifiers(q)
+        if toks:
+            try:
+                sql = "SELECT d.qn qualified_name,d.name,d.kind,d.file file_path,d.start_line,bm25(decl_fts) rank FROM decl_fts JOIN decls d ON d.id=decl_fts.rowid WHERE decl_fts MATCH ?"
+                if kinds:
+                    sql += " AND d.kind IN (" + ",".join("?" for _ in kinds) + ")"
+                sql += " ORDER BY rank LIMIT ?"
+                rows = con.execute(sql, (fts(q),) + kind_params + (limit,)).fetchall()
+                add(rows, 420, "fts_fallback")
+            except sqlite3.Error:
+                pass
+    if len(ranked) < limit:
+        like = f"%{leaf or q}%"
+        fetch("qn LIKE ? OR name LIKE ?", (like, like), 300, "substring_fallback")
+    ranked.sort(key=lambda item: (-item.get("suggestion_score", 0), len(item.get("qualified_name", "")), item.get("file_path", ""), item.get("start_line", 0)))
+    return ranked[:limit]
+
+
+def suggestion_response(con, q, limit=10, kinds=None):
+    items = decl_suggestions(con, q, max(limit * 3, limit + 10), kinds)
+    strong = [item for item in items if item.get("suggestion_score", 0) >= 900]
+    fallback = [item for item in items if item.get("suggestion_score", 0) < 900]
+    if strong:
+        primary = strong[:limit]
+    else:
+        primary = fallback[:limit]
+        fallback = fallback[limit:]
+    out = {
+        "found": False,
+        "suggestions": primary,
+        "suggestion_policy": "exact/name/suffix suggestions are primary; weaker part/FTS/substring matches are returned separately when present",
+    }
+    if fallback:
+        out["fallback_suggestions"] = fallback[:limit]
+    return out
+
+
 def fts(q):
     toks = lean_identifiers(q)
     return " OR ".join(f'"{t}"' for t in toks) if toks else str(q).replace('"', '""')
@@ -907,6 +1032,9 @@ def search_theorems(args, repo):
     conclusion_toks = query_tokens(args.get("conclusion"))
     premise_toks = query_tokens(args.get("premise") or args.get("premises"))
     symbol_toks = query_tokens(args.get("symbol") or args.get("symbols"))
+    query_shape_terms = shape_terms(args.get("query"))
+    conclusion_shape_terms = shape_terms(args.get("conclusion"))
+    symbol_shape_terms = shape_terms(args.get("symbol") or args.get("symbols"))
     name_pat, qn_pat, file_pat = args.get("name_pattern"), args.get("qn_pattern"), args.get("file_pattern")
     rows = list(con.execute("SELECT * FROM decls WHERE kind IN ('theorem','lemma','abbrev')"))
     scored = []
@@ -918,12 +1046,17 @@ def search_theorems(args, repo):
         short_name = r["name"] or ""
         qn_text = r["qn"] or ""
         name_text = f"{short_name} {qn_text}"
-        theorem_text = "\n".join([r["conclusion"] or "", r["premises"] or "", r["head_symbols"] or "", r["stmt"] or ""])
+        conclusion_text = r["conclusion"] or ""
+        premise_text = r["premises"] or ""
+        head_text = r["head_symbols"] or ""
+        stmt_text = r["stmt"] or ""
+        theorem_text = "\n".join([conclusion_text, premise_text, head_text, stmt_text])
         if toks and not contains_any(name_text + "\n" + theorem_text, toks): continue
-        if conclusion_toks and not contains_all(r["conclusion"] or "", conclusion_toks): continue
-        if premise_toks and not contains_any(r["premises"] or "", premise_toks): continue
-        if symbol_toks and not contains_all(r["head_symbols"] or "", symbol_toks): continue
+        if conclusion_toks and not contains_any(conclusion_text + "\n" + stmt_text, conclusion_toks): continue
+        if premise_toks and not contains_any(premise_text + "\n" + stmt_text, premise_toks): continue
+        if symbol_toks and not contains_any("\n".join([head_text, conclusion_text, qn_text, stmt_text]), symbol_toks): continue
         score = 0
+        shape_overlap = []
         if toks:
             compact = "".join(toks)
             short_lower = short_name.lower()
@@ -933,14 +1066,41 @@ def search_theorems(args, repo):
             elif contains_any(short_name, toks): score += 120
             elif contains_all(qn_text, toks): score += 80
             elif contains_any(qn_text, toks): score += 45
-            if contains_all(r["conclusion"] or "", toks): score += 70
-            elif contains_any(r["conclusion"] or "", toks): score += 45
-            if contains_any(r["head_symbols"] or "", toks): score += 35
-            if contains_any(r["premises"] or "", toks): score += 20
-            if contains_any(r["stmt"] or "", toks): score += 10
-        if conclusion_toks: score += 60
+            if contains_all(conclusion_text, toks): score += 70
+            elif contains_any(conclusion_text, toks): score += 45
+            if contains_any(head_text, toks): score += 35
+            if contains_any(premise_text, toks): score += 20
+            if contains_any(stmt_text, toks): score += 10
+        if query_shape_terms:
+            shape_bonus, _, shape_overlap = shape_score(query_shape_terms, r, False)
+            qset = set(query_shape_terms)
+            score += shape_bonus * 3
+            score += 75 * len(text_term_hits(qset, head_text))
+            score += 55 * len(text_term_hits(qset, conclusion_text))
+            score += 20 * len(text_term_hits(qset, qn_text))
+            if len(set(shape_overlap)) >= min(3, len(qset)):
+                score += 90
+        if conclusion_shape_terms:
+            shape_bonus, _, overlap = shape_score(conclusion_shape_terms, r, False)
+            cset = set(conclusion_shape_terms)
+            score += 180 + shape_bonus * 4
+            score += 90 * len(text_term_hits(cset, conclusion_text))
+            score += 35 * len(text_term_hits(cset, head_text))
+            if overlap:
+                shape_overlap = list(dict.fromkeys(shape_overlap + overlap))
         if premise_toks: score += 25
-        if symbol_toks: score += 40
+        if symbol_toks or symbol_shape_terms:
+            symbol_terms = symbol_shape_terms or symbol_toks
+            sset = set(symbol_terms)
+            symbol_text = "\n".join([head_text, qn_text, conclusion_text])
+            hits = text_term_hits(sset, symbol_text)
+            if symbol_toks and not hits:
+                continue
+            score += 120 + 140 * len(hits)
+            if sset and all(t in hits for t in sset):
+                score += 100
+        if conclusion_toks: score += 60
+        score -= generic_theorem_penalty(short_name, qn_text, query_shape_terms + conclusion_shape_terms + symbol_shape_terms, shape_overlap)
         scored.append((score, r))
     scored.sort(key=lambda x: (-x[0], x[1]["kind"] != "theorem", x[1]["file"], x[1]["start_line"]))
     filt = [r for _, r in scored]
@@ -966,9 +1126,14 @@ def shape_terms(text):
             continue
         if len(short) == 1:
             continue
-        terms.append(ident.lower())
+        ident_lower = ident.lower()
+        short_lower = short.lower()
+        terms.append(ident_lower)
         if "." in ident:
-            terms.append(short.lower())
+            terms.append(short_lower)
+        for part in short_lower.replace("'", "_").split("_"):
+            if len(part) > 1 and part not in SHAPE_STOP:
+                terms.append(part)
     seen, out = set(), []
     for t in terms:
         if t and t not in seen:
@@ -1008,6 +1173,35 @@ def shape_score(query_terms, row, require_important=True):
         score += 5
     return score, cand, overlap
 
+
+GENERIC_RESULT_NAMES = {"add", "sub", "neg", "map", "smul", "mul", "zero", "one", "eq", "ne", "coe", "transpose", "conjtranspose", "star", "apply"}
+GENERIC_SHAPE_TERMS = {"eq", "iff", "of", "to", "is", "has", "map", "add", "sub", "mul", "one", "zero", "theorem", "lemma"}
+
+
+def text_term_hits(terms, text):
+    lower = str(text or "").lower()
+    return [t for t in terms if t and t.lower() in lower]
+
+
+def strong_shape_terms(terms):
+    return [t for t in terms if len(t) > 2 and t.lower() not in GENERIC_SHAPE_TERMS]
+
+
+def generic_theorem_penalty(short_name, qn_text, query_terms, overlap):
+    strong = set(strong_shape_terms(query_terms))
+    if len(strong) < 3:
+        return 0
+    leaf = (short_name or "").split(".")[-1].lower()
+    leaf_parts = {p for p in leaf.replace("'", "_").split("_") if p}
+    matched = set(overlap or []) & strong
+    qn_lower = (qn_text or "").lower()
+    if leaf in GENERIC_RESULT_NAMES and len(matched) < 2:
+        return 180
+    if "ishermitian" in qn_lower and leaf in {"add", "sub", "map", "neg", "smul", "mul"} and len(matched) < 2:
+        return 220
+    if leaf_parts and leaf_parts <= GENERIC_RESULT_NAMES and len(matched) < 2:
+        return 160
+    return 0
 
 def search_shape(args, repo):
     ensure_index(repo); con = connect(repo)
@@ -1085,8 +1279,7 @@ def get_code_snippet(args, repo):
     q = str(args.get("qualified_name") or args.get("function_name") or args.get("name") or "")
     rows = con.execute("SELECT * FROM decls WHERE qn=? OR name=? ORDER BY length(qn) LIMIT 5", (q,q)).fetchall()
     if not rows:
-        sug = con.execute("SELECT qn qualified_name,name,kind,file file_path,start_line FROM decls WHERE qn LIKE ? OR name LIKE ? LIMIT 10", (f"%{q}%", f"%{q}%")).fetchall()
-        return {"found": False, "suggestions": [dict(x) for x in sug]}
+        return suggestion_response(con, q, 10)
     if len(rows) > 1 and rows[0]["qn"] != q:
         return {"found": False, "ambiguous": True, "suggestions": [dict(x) for x in rows]}
     r = rows[0]
@@ -1116,8 +1309,7 @@ def get_context(args, repo):
     q = str(args.get("qualified_name") or args.get("function_name") or args.get("name") or "")
     r, rows = lookup_decl(con, q)
     if r is None and not rows:
-        sug = con.execute("SELECT qn qualified_name,name,kind,file file_path,start_line FROM decls WHERE qn LIKE ? OR name LIKE ? LIMIT 10", (f"%{q}%", f"%{q}%")).fetchall()
-        return {"found": False, "suggestions": [dict(x) for x in sug]}
+        return suggestion_response(con, q, 10)
     if r is None:
         return {"found": False, "ambiguous": True, "suggestions": [dict(x) for x in rows]}
     fr = con.execute("SELECT * FROM files WHERE path=?", (r["file"],)).fetchone()
@@ -1198,6 +1390,24 @@ def root_module_candidates(repo, con):
     return roots
 
 
+def is_archived_validation_path(rel):
+    parts = [p.lower() for p in norm_rel(rel).split("/")]
+    markers = {"archive", "archived", "archives", "validation", "validations", "external", "blocked_clean"}
+    if any(p in markers for p in parts):
+        return True
+    return any("validation" in p or "archive" in p or "blocked" in p for p in parts)
+
+
+def split_unexposed_files(paths):
+    archived, source_test = [], []
+    for rel in paths:
+        if is_archived_validation_path(rel):
+            archived.append(rel)
+        else:
+            source_test.append(rel)
+    return source_test, archived
+
+
 def root_import_visibility(repo, con, args=None):
     args = args or {}
     rows = list(con.execute("SELECT path,content FROM files WHERE path LIKE '%.lean'"))
@@ -1219,8 +1429,21 @@ def root_import_visibility(repo, con, args=None):
             continue
         seen.add(rel); stack.extend(graph.get(rel, []))
     unexposed = sorted(rel for rel in set(content) - seen if file_in_scope(rel, args))
-    return {"roots": roots, "reachable_files": len(seen), "lean_files": len(content), "unexposed_files": len(unexposed), "unexposed_sample": unexposed[:int(args.get("detail_limit") or 30)]}
-
+    source_test, archived = split_unexposed_files(unexposed)
+    limit = int(args.get("detail_limit") or 30)
+    archived_limit = limit if args.get("details", True) or args.get("include_archived") else min(5, limit)
+    return {
+        "roots": roots,
+        "reachable_files": len(seen),
+        "lean_files": len(content),
+        "unexposed_files": len(unexposed),
+        "source_test_unexposed_files": len(source_test),
+        "source_test_unexposed_sample": source_test[:limit],
+        "archived_validation_unexposed_files": len(archived),
+        "archived_validation_unexposed_sample": archived[:archived_limit],
+        "unexposed_sample": source_test[:limit],
+        "unexposed_sample_policy": "source/test files first; archived validation files are split separately",
+    }
 
 def index_visibility(args, repo):
     con = connect(repo)
@@ -1308,8 +1531,8 @@ def theorem_card_tool(args, repo):
     q = str(args.get("qualified_name") or args.get("name") or "")
     r, rows = lookup_decl(con, q)
     if r is None and not rows:
-        sug = con.execute("SELECT qn qualified_name,name,kind,file file_path,start_line FROM decls WHERE qn LIKE ? OR name LIKE ? LIMIT 10", (f"%{q}%", f"%{q}%")).fetchall()
-        con.close(); return {"found": False, "suggestions": [dict(x) for x in sug]}
+        out = suggestion_response(con, q, 10)
+        con.close(); return out
     if r is None:
         con.close(); return {"found": False, "ambiguous": True, "suggestions": [dict(x) for x in rows]}
     out = theorem_card(repo, con, r, bool(args.get("include_source")))
@@ -1365,7 +1588,12 @@ def proof_probe(args, default_repo):
     con.close()
     imports = normalize_imports(imports + suggested)
     lines = [f"import {imp}" for imp in imports]
-    lines.extend(["set_option maxHeartbeats 400000", "set_option pp.universes true", "set_option pp.all true"])
+    verbose = bool(args.get("verbose") or args.get("full_type") or args.get("pp_all"))
+    lines.append("set_option maxHeartbeats 400000")
+    if verbose:
+        lines.extend(["set_option pp.all true", "set_option pp.universes true", "set_option pp.explicit true"])
+    else:
+        lines.extend(["set_option pp.all false", "set_option pp.universes false", "set_option pp.explicit false"])
     for q in checks:
         lines.append(f"#check {q}")
     if args.get("code"):
@@ -1380,13 +1608,13 @@ def proof_probe(args, default_repo):
     probe_file = probe_dir / f"Probe_{int(time.time() * 1000)}.lean"
     probe_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
     cmd = ["lake", "env", "lean", str(probe_file)]
-    timeout = int(args.get("timeout_sec") or 60)
+    timeout = int(args.get("timeout_sec") or 180)
     try:
         proc = subprocess.run(cmd, cwd=str(run_repo), text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=timeout)
         output = (proc.stdout or "") + (proc.stderr or "")
-        return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "run_repo": str(run_repo), "probe_file": str(probe_file), "imports": imports, "checks": checks, "command": " ".join(cmd), "diagnosis": diagnose_lean_output(output), "stdout": proc.stdout, "stderr": proc.stderr}
+        return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "run_repo": str(run_repo), "probe_file": str(probe_file), "imports": imports, "checks": checks, "verbose": verbose, "timeout_sec": timeout, "command": " ".join(cmd), "diagnosis": diagnose_lean_output(output), "stdout": proc.stdout, "stderr": proc.stderr}
     except subprocess.TimeoutExpired as exc:
-        return {"ok": False, "exit_code": None, "run_repo": str(run_repo), "probe_file": str(probe_file), "imports": imports, "checks": checks, "command": " ".join(cmd), "diagnosis": ["timeout"], "stdout": exc.stdout, "stderr": exc.stderr}
+        return {"ok": False, "exit_code": None, "run_repo": str(run_repo), "probe_file": str(probe_file), "imports": imports, "checks": checks, "verbose": verbose, "timeout_sec": timeout, "command": " ".join(cmd), "diagnosis": ["timeout"], "message": f"lake env lean exceeded timeout_sec={timeout}; increase timeout_sec for heavy Mathlib imports or use narrower imports.", "stdout": exc.stdout, "stderr": exc.stderr}
 
 
 def configured_repos(default_repo, names=None):
@@ -1419,8 +1647,46 @@ def cross_repo_lookup(args, default_repo):
     return out
 
 
+CONSUMER_FIT_CLASSES = ["exact_duplicate", "migrated_copy", "prerequisite_leaf", "downstream_consumer", "unrelated_shape_match"]
+
+
+def compact_statement(text):
+    return " ".join(str(text or "").split())
+
+
+def classify_consumer_candidate(target_row, target_card, target_project, project_label, cr, overlap):
+    target_qn = target_card.get("qualified_name") or ""
+    target_name = target_card.get("name") or ""
+    candidate_qn = cr["qn"] or ""
+    candidate_name = cr["name"] or ""
+    if project_label == target_project and candidate_qn == target_qn:
+        return "exact_duplicate"
+    same_short_name = candidate_name == target_name or candidate_qn.split(".")[-1] == target_name
+    if same_short_name:
+        same_stmt = compact_statement(cr["stmt"]) == compact_statement(target_row["stmt"])
+        if project_label != target_project or same_stmt:
+            return "migrated_copy"
+    target_source = target_row["src"] or ""
+    candidate_source = cr["src"] or ""
+    if target_name and target_name in candidate_source and candidate_qn != target_qn:
+        return "downstream_consumer"
+    candidate_names = [candidate_qn, candidate_name]
+    if any(name and name in target_source for name in candidate_names):
+        return "prerequisite_leaf"
+    if overlap:
+        return "prerequisite_leaf"
+    return "unrelated_shape_match"
+
+
+def add_classified_candidate(buckets, cls, item, limit):
+    bucket = buckets.setdefault(cls, [])
+    if len(bucket) < limit:
+        bucket.append(item)
+
+
 def consumer_fit(args, default_repo):
-    repo = repo_arg({"project": args.get("project") or "provider"}, default_repo)
+    target_project = str(args.get("project") or "provider")
+    repo = repo_arg({"project": target_project}, default_repo)
     ensure_index(repo); con = connect(repo)
     q = str(args.get("consumer") or args.get("qualified_name") or args.get("name") or "")
     r, rows = lookup_decl(con, q)
@@ -1432,30 +1698,36 @@ def consumer_fit(args, default_repo):
     con.close()
     projects = as_list(args.get("projects")) or DEFAULT_CROSS_PROJECTS
     per_obligation = []
+    candidate_limit = int(args.get("candidates_per_obligation") or 6)
+    class_limit = max(candidate_limit, int(args.get("class_limit") or candidate_limit))
+    scan_limit = max(12, candidate_limit * 6)
+    hidden_classes = {"exact_duplicate", "migrated_copy", "downstream_consumer"}
     for obl in obligations[:int(args.get("max_obligations") or 8)]:
         if not str(obl).strip():
             continue
         qterms = shape_terms(obl)
         candidates = []
+        classified = {key: [] for key in CONSUMER_FIT_CLASSES}
         for label, cand_repo in configured_repos(default_repo, projects):
             if not db_path(cand_repo).exists():
                 continue
             ccon = connect(cand_repo)
             scored = []
             for cr in ccon.execute("SELECT * FROM decls WHERE kind IN ('theorem','lemma','abbrev')"):
-                if cr["qn"] == target["qualified_name"]:
-                    continue
                 score, overlap, _ = shape_score(qterms, cr, False)
                 if score > 0:
                     scored.append((score, overlap, cr))
             scored.sort(key=lambda x: -x[0])
-            for score, overlap, cr in scored[:3]:
-                item = theorem_result(cr); item["project"] = label; item["shape_score"] = score; item["matched_shape_terms"] = overlap; item["import"] = import_for_file(cr["file"])
-                candidates.append(item)
+            for score, overlap, cr in scored[:scan_limit]:
+                cls = classify_consumer_candidate(r, target, target_project, label, cr, overlap)
+                item = theorem_result(cr); item["project"] = label; item["consumer_fit_class"] = cls; item["shape_score"] = score; item["matched_shape_terms"] = overlap; item["import"] = import_for_file(cr["file"])
+                add_classified_candidate(classified, cls, item, class_limit)
+                if cls not in hidden_classes:
+                    candidates.append(item)
             ccon.close()
         candidates.sort(key=lambda x: -x["shape_score"])
-        per_obligation.append({"obligation_shape": obl, "candidates": candidates[:int(args.get("candidates_per_obligation") or 6)]})
-    return {"found": True, "consumer": target, "source_shape_terms": source_terms[:60], "obligation_candidates": per_obligation, "note": "Heuristic consumer-fit: matches premise/conclusion shape; run proof_probe for elaboration."}
+        per_obligation.append({"obligation_shape": obl, "candidates": candidates[:candidate_limit], "classified_candidates": classified, "filtered_candidate_classes": sorted(hidden_classes)})
+    return {"found": True, "consumer": target, "source_shape_terms": source_terms[:60], "obligation_candidates": per_obligation, "note": "Heuristic consumer-fit: exact duplicates, migrated copies, and downstream consumers are classified separately; run proof_probe for elaboration."}
 
 def project_templates(args):
     return {"topics": TOPIC_PATHS, "search_templates": [
@@ -1476,7 +1748,7 @@ TOOLS = {
  "index_visibility": ("Report tracked/untracked indexed files, stale files, and root-import exposure.", {"type":"object","properties":{"repo_path":{"type":"string"},"project":{"type":"string"},"details":{"type":"boolean"},"root":{"type":"string"},"roots":{"type":"array","items":{"type":"string"}},"topic":{"type":"string"},"path_prefix":{"type":"string"},"detail_limit":{"type":"integer"}}}),
  "search_shape": ("Search theorem-like declarations by syntactic type-shape overlap, e.g. Matrix.trace (cfc f A) = _ or HasDerivAt inverse affine-line shapes.", {"type":"object","properties":{"shape":{"type":"string"},"query":{"type":"string"},"type":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"min_score":{"type":"integer"},"cards":{"type":"boolean"},"include_source":{"type":"boolean"},"repo_path":{"type":"string"},"project":{"type":"string"},"topic":{"type":"string"},"path_prefix":{"type":"string"},"path_filter":{"type":"string"},"file_pattern":{"type":"string"}}}),
  "theorem_card": ("Return a rich theorem card: statement, import, location, namespace, typeclass hints, and minimal #check.", {"type":"object","properties":{"qualified_name":{"type":"string"},"name":{"type":"string"},"include_source":{"type":"boolean"},"repo_path":{"type":"string"},"project":{"type":"string"}}}),
- "proof_probe": ("Generate a temporary Lean file and run lake env lean for #check/example probes; reports import/name/typeclass/type mismatch diagnostics.", {"type":"object","properties":{"project":{"type":"string"},"repo_path":{"type":"string"},"run_project":{"type":"string"},"run_repo_path":{"type":"string"},"imports":{"type":"array","items":{"type":"string"}},"checks":{"type":"array","items":{"type":"string"}},"check":{"type":"string"},"qualified_name":{"type":"string"},"name":{"type":"string"},"goal":{"type":"string"},"proof":{"type":"string"},"example":{"type":"string"},"code":{"type":"string"},"timeout_sec":{"type":"integer"}}}),
+ "proof_probe": ("Generate a temporary Lean file and run lake env lean for #check/example probes; reports import/name/typeclass/type mismatch diagnostics.", {"type":"object","properties":{"project":{"type":"string"},"repo_path":{"type":"string"},"run_project":{"type":"string"},"run_repo_path":{"type":"string"},"imports":{"type":"array","items":{"type":"string"}},"checks":{"type":"array","items":{"type":"string"}},"check":{"type":"string"},"qualified_name":{"type":"string"},"name":{"type":"string"},"goal":{"type":"string"},"proof":{"type":"string"},"example":{"type":"string"},"code":{"type":"string"},"timeout_sec":{"type":"integer"},"verbose":{"type":"boolean"},"full_type":{"type":"boolean"},"pp_all":{"type":"boolean"}}}),
  "consumer_fit": ("Heuristically match a consumer theorem premise/conclusion shape against provider/HighDimProb/Mathlib candidate leaf theorems.", {"type":"object","properties":{"consumer":{"type":"string"},"qualified_name":{"type":"string"},"name":{"type":"string"},"project":{"type":"string"},"projects":{"type":"array","items":{"type":"string"}},"max_obligations":{"type":"integer"},"candidates_per_obligation":{"type":"integer"}}}),
  "cross_repo_lookup": ("Search provider/HighDimProb/Mathlib for same-name declarations and textual users.", {"type":"object","properties":{"query":{"type":"string"},"name":{"type":"string"},"qualified_name":{"type":"string"},"projects":{"type":"array","items":{"type":"string"}},"limit":{"type":"integer"}}}),
  "project_templates": ("Return HighDimProb/LiebProvider-specific search and proof-probe templates.", {"type":"object","properties":{}}),
