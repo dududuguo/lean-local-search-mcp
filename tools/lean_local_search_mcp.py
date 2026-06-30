@@ -513,6 +513,112 @@ def ts_decls(data):
                 out[(node.start_byte, node.end_byte)] = {"kind": node.type, "name": name, "start": node.start_byte, "end": node.end_byte}
     return [out[k] for k in sorted(out)]
 
+def trim_leading_attributes(stripped):
+    s = stripped
+    while s.startswith("@["):
+        depth = 0
+        i = 0
+        in_string = False
+        escaped = False
+        while i < len(s):
+            ch = s[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    s = s[i + 1:].lstrip()
+                    break
+            i += 1
+        else:
+            return ""
+    return s
+
+
+def decl_header_from_line(line):
+    stripped = str(line or "").strip()
+    if not stripped or stripped.startswith(("--", "/-")):
+        return None
+    stripped = trim_leading_attributes(stripped)
+    if not stripped:
+        return None
+    tokens = lean_identifiers(stripped)
+    if not tokens:
+        return None
+    pos = 0
+    while pos < len(tokens) and tokens[pos] in DECL_MODIFIERS:
+        pos += 1
+    if pos >= len(tokens) or tokens[pos] not in KINDS:
+        return None
+    kind = tokens[pos]
+    keyword_at = stripped.find(kind)
+    if keyword_at < 0:
+        return None
+    after = stripped[keyword_at + len(kind):].lstrip()
+    name = "_anonymous"
+    if kind != "example" and after and after[0] not in ":=({[":
+        names = lean_identifiers(after)
+        if names:
+            name = names[0]
+    return kind, name
+
+
+def comment_depth_after_line(line, depth):
+    code = str(line or "").split("--", 1)[0]
+    i = 0
+    while i < len(code):
+        start = code.find("/-", i)
+        end = code.find("-/", i)
+        if start < 0 and end < 0:
+            break
+        if start >= 0 and (end < 0 or start < end):
+            depth += 1
+            i = start + 2
+        else:
+            depth = max(0, depth - 1)
+            i = end + 2
+    return depth
+
+
+def scanner_decl_headers(data):
+    text = data.decode("utf-8", "replace")
+    headers = []
+    depth = 0
+    byte_offset = 0
+    for raw_line in text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        code = line.split("--", 1)[0]
+        if depth == 0:
+            parsed = decl_header_from_line(code)
+            if parsed is not None:
+                kind, name = parsed
+                leading = len(line) - len(line.lstrip())
+                start = byte_offset + len(line[:leading].encode("utf-8"))
+                headers.append({"kind": kind, "name": name, "start": start})
+        depth = comment_depth_after_line(code, depth)
+        byte_offset += len(raw_line.encode("utf-8"))
+    return headers
+
+
+def scanner_decls(data):
+    headers = scanner_decl_headers(data)
+    out = []
+    for idx, item in enumerate(headers):
+        end = headers[idx + 1]["start"] if idx + 1 < len(headers) else len(data)
+        if end <= item["start"]:
+            continue
+        out.append({"kind": item["kind"], "name": item["name"], "start": item["start"], "end": end})
+    return out
+
 def regex_decls(data):
     text = data.decode("utf-8", "replace")
     ms = list(DECL_RE.finditer(text)); out = []
@@ -637,7 +743,7 @@ def analyze_statement(kind, name, stmt):
 def extract_file(repo, path):
     data = path.read_bytes(); text = data.decode("utf-8", "replace")
     lines = text.splitlines(); rel = path.relative_to(repo).as_posix()
-    raw = (ts_decls(data) or regex_decls(data)) if path.suffix.lower() == ".lean" else []
+    raw = (scanner_decls(data) or ts_decls(data) or regex_decls(data)) if path.suffix.lower() == ".lean" else []
     decls, seen = [], set()
     for item in raw:
         src = data[item["start"]:item["end"]].decode("utf-8", "replace").strip()

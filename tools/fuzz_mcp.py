@@ -66,6 +66,15 @@ theorem nested_after_section (n : Nat) : n = n := by
 
 end Nested
 
+/-- A first theorem with a longer calc proof. -/
+theorem calc_range_first (n : Nat) : n = n := by
+  calc
+    n = n := rfl
+
+/-- A second theorem immediately after a doc comment must be a separate declaration. -/
+theorem calc_range_second (n : Nat) : n = n := by
+  rfl
+
 end Fuzz
 """,
     )
@@ -194,6 +203,10 @@ def main() -> int:
         try:
             nested = con.execute("SELECT qn FROM decls WHERE name=?", ("nested_after_section",)).fetchone()
             assert nested is not None and nested["qn"] == "Fuzz.Nested.nested_after_section", nested["qn"] if nested else None
+            second = con.execute("SELECT qn FROM decls WHERE name=?", ("calc_range_second",)).fetchone()
+            assert second is not None and second["qn"] == "Fuzz.calc_range_second", second["qn"] if second else None
+            first_src = con.execute("SELECT src FROM decls WHERE name=?", ("calc_range_first",)).fetchone()["src"]
+            assert "calc_range_second" not in first_src, first_src
         finally:
             con.close()
         for i in range(args.iterations):
