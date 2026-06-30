@@ -142,6 +142,10 @@ def random_args(rng: random.Random, tool: str, repo: Path, existing: bool):
         args = dict(base_project); args.update({"details": rng.choice([True, False]), "detail_limit": rng.randint(1, 10)}); args.update(rng.choice(scopes)); return args
     if tool == "index_visibility":
         args = dict(base_project); args.update({"details": True, "detail_limit": rng.randint(1, 10)}); return args
+    if tool == "debug_parse_file":
+        if existing:
+            return {"project": "provider", "file": "HighDimProbLiebProvider/TraceExp/LogResolvent.lean", "pattern": "traceMulResolventCutoff", "max_errors": 5, "decl_limit": 5, "hit_limit": 3}
+        return {"repo_path": str(repo), "file": rng.choice(["FuzzRepo/Basic.lean", "FuzzRepo/Matrix.lean"]), "pattern": rng.choice(["calc_range_second", "trace_cfc_shape", "missing_name"]), "max_errors": 5, "decl_limit": 5, "hit_limit": 3}
     if tool == "cache_status":
         return dict(base_project) if rng.random() < 0.7 else {}
     if tool == "search_graph":
@@ -190,7 +194,7 @@ def main() -> int:
     temp_root = Path(tempfile.mkdtemp(prefix="lean-local-search-fuzz-"))
     failures = []
     tools = [
-        "index_repository", "index_status", "index_visibility", "cache_status", "search_graph",
+        "index_repository", "index_status", "index_visibility", "debug_parse_file", "cache_status", "search_graph",
         "search_theorems", "search_shape", "theorem_card", "get_context", "get_code_snippet",
         "search_code", "trace_path", "get_architecture", "project_templates", "cross_repo_lookup",
         "consumer_fit",

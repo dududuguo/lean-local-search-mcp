@@ -619,6 +619,230 @@ def scanner_decls(data):
         out.append({"kind": item["kind"], "name": item["name"], "start": item["start"], "end": end})
     return out
 
+def line_col_of(data, byte):
+    byte = max(0, min(len(data), int(byte or 0)))
+    line_start = data.rfind(b"\n", 0, byte) + 1
+    return {"line": line_of(data, byte), "column": byte - line_start}
+
+
+def source_excerpt(data, start, end, max_chars=240):
+    text = data[max(0, start):min(len(data), end)].decode("utf-8", "replace").replace("\r", "")
+    text = "\n".join(text.splitlines()[:8])
+    return text[:max_chars]
+
+
+def debug_decl_item(data, item):
+    start, end = int(item.get("start") or 0), int(item.get("end") or 0)
+    out = {
+        "kind": item.get("kind"),
+        "name": item.get("name"),
+        "start_byte": start,
+        "end_byte": end,
+        "start": line_col_of(data, start),
+        "end": line_col_of(data, max(start, end - 1)),
+        "bytes": max(0, end - start),
+        "excerpt": source_excerpt(data, start, end),
+    }
+    if "has_error" in item:
+        out["has_error"] = bool(item.get("has_error"))
+    return out
+
+
+def tree_sitter_root(data):
+    try:
+        from tree_sitter import Language, Parser
+        import tree_sitter_lean
+        lang = Language(tree_sitter_lean.language())
+        parser = Parser(lang)
+        return parser.parse(data).root_node, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def ts_decls_with_errors(data):
+    try:
+        from tree_sitter import Language, Parser, Query, QueryCursor
+        import tree_sitter_lean
+        lang = Language(tree_sitter_lean.language())
+        parser = Parser(lang)
+        root = parser.parse(data).root_node
+        query = Query(lang, tree_sitter_lean.LOCALS_QUERY)
+        cursor = QueryCursor(query)
+    except Exception as exc:
+        return [], None, str(exc)
+    out = {}
+    decl_node_types = {"def","theorem","abbrev","instance","axiom","opaque","constant","structure","inductive"}
+    for _pat, caps in cursor.matches(root):
+        for cap, nodes in caps.items():
+            if cap not in {"local.definition.function", "local.definition.type"}:
+                continue
+            for name_node in nodes:
+                node = name_node.parent
+                while node is not None and node.type not in decl_node_types:
+                    node = node.parent
+                if node is None:
+                    continue
+                name = data[name_node.start_byte:name_node.end_byte].decode("utf-8", "replace")
+                out[(node.start_byte, node.end_byte, name)] = {
+                    "kind": node.type,
+                    "name": name,
+                    "start": node.start_byte,
+                    "end": node.end_byte,
+                    "has_error": node.has_error,
+                }
+    return [out[k] for k in sorted(out)], root, None
+
+
+def collect_ts_errors(data, root, max_errors=30, focus_byte=None):
+    if root is None:
+        return []
+    interesting = {"module", "declaration", "theorem", "def", "by", "have", "let", "app", "paren", "fun", "ERROR"}
+    errors = []
+    stack = [(root, 0)]
+    while stack and len(errors) < max_errors:
+        node, depth = stack.pop()
+        if focus_byte is not None and not (node.start_byte <= focus_byte < node.end_byte):
+            for child in reversed(node.children):
+                if child.has_error or child.type == "ERROR" or child.start_byte <= focus_byte < child.end_byte:
+                    stack.append((child, depth + 1))
+            continue
+        if node.type == "ERROR" or (node.has_error and node.type in interesting):
+            errors.append({
+                "type": node.type,
+                "depth": depth,
+                "start": line_col_of(data, node.start_byte),
+                "end": line_col_of(data, max(node.start_byte, node.end_byte - 1)),
+                "bytes": max(0, node.end_byte - node.start_byte),
+                "excerpt": source_excerpt(data, node.start_byte, node.end_byte, 320),
+            })
+        for child in reversed(node.children):
+            if child.has_error or child.type == "ERROR":
+                stack.append((child, depth + 1))
+    return errors
+
+
+def compare_decl_ranges(data, scanner, ts_items):
+    scanner_by_name = {}
+    for item in scanner:
+        scanner_by_name.setdefault(item.get("name"), []).append(item)
+    ts_by_name = {}
+    for item in ts_items:
+        ts_by_name.setdefault(item.get("name"), []).append(item)
+    swallowed = []
+    for ts in ts_items:
+        inside = [sc for sc in scanner if sc["start"] > ts["start"] and sc["start"] < ts["end"]]
+        if inside:
+            swallowed.append({
+                "tree_sitter_decl": debug_decl_item(data, ts),
+                "scanner_starts_inside": [debug_decl_item(data, sc) for sc in inside[:20]],
+                "scanner_starts_inside_count": len(inside),
+            })
+    missing = sorted(name for name in scanner_by_name if name not in ts_by_name)
+    extra = sorted(name for name in ts_by_name if name not in scanner_by_name)
+    return {"tree_sitter_swallowed_scanner_decls": swallowed, "missing_from_tree_sitter": missing, "extra_in_tree_sitter": extra}
+
+
+def owner_for_byte(items, byte):
+    owners = [item for item in items if item["start"] <= byte < item["end"]]
+    if not owners:
+        return None
+    owners.sort(key=lambda item: (item["end"] - item["start"], item["start"]))
+    return owners[0]
+
+
+def debug_pattern_owners(data, pattern, scanner, ts_items, limit=20):
+    if not pattern:
+        return []
+    raw = str(pattern).encode("utf-8")
+    hits, pos = [], 0
+    while raw and len(hits) < limit:
+        idx = data.find(raw, pos)
+        if idx < 0:
+            break
+        scanner_owner = owner_for_byte(scanner, idx)
+        ts_owner = owner_for_byte(ts_items, idx)
+        hits.append({
+            "pattern": str(pattern),
+            "position": line_col_of(data, idx),
+            "scanner_owner": debug_decl_item(data, scanner_owner) if scanner_owner else None,
+            "tree_sitter_owner": debug_decl_item(data, ts_owner) if ts_owner else None,
+        })
+        pos = idx + max(1, len(raw))
+    return hits
+
+
+def select_debug_decls(data, items, pattern=None, limit=80):
+    if pattern:
+        pat = str(pattern)
+        selected = []
+        raw = pat.encode("utf-8")
+        for item in items:
+            body = data[item["start"]:item["end"]]
+            if pat in str(item.get("name", "")) or (raw and raw in body):
+                selected.append(item)
+        if selected:
+            return [debug_decl_item(data, item) for item in selected[:limit]]
+    return [debug_decl_item(data, item) for item in items[:limit]]
+
+
+def find_debug_file(repo, args):
+    rel = args.get("file") or args.get("file_path") or args.get("path_prefix")
+    pattern = args.get("pattern") or args.get("name") or args.get("qualified_name")
+    if pattern and "." in str(pattern):
+        pattern = str(pattern).split(".")[-1]
+    if rel:
+        rel = norm_rel(rel)
+        path = (Path(repo) / rel).resolve()
+        if path.exists() and path.is_file():
+            return path, rel, pattern
+        raise FileNotFoundError(str(path))
+    if not pattern:
+        raise ValueError("debug_parse_file needs file/file_path/path_prefix or pattern/name/qualified_name")
+    for path in indexed_files(repo, {"file_pattern": "*.lean"}):
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if str(pattern).encode("utf-8") in data:
+            return path, path.relative_to(repo).as_posix(), pattern
+    raise FileNotFoundError(f"no Lean file under {repo} contains pattern {pattern!r}")
+
+
+def debug_parse_file(args, repo):
+    path, rel, pattern = find_debug_file(repo, args)
+    data = path.read_bytes()
+    scanner = scanner_decls(data)
+    regex = regex_decls(data)
+    ts_items, root, ts_error = ts_decls_with_errors(data)
+    max_errors = int(args.get("max_errors") or 30)
+    decl_limit = int(args.get("decl_limit") or 80)
+    focus_byte = data.find(str(pattern).encode("utf-8")) if pattern else -1
+    if focus_byte < 0:
+        focus_byte = None
+    report = {
+        "repo_path": str(repo),
+        "file_path": rel,
+        "pattern": pattern,
+        "focus_position": line_col_of(data, focus_byte) if focus_byte is not None else None,
+        "parser_layers": {
+            "scanner_count": len(scanner),
+            "tree_sitter_count": len(ts_items),
+            "regex_count": len(regex),
+            "tree_sitter_available": ts_error is None,
+            "tree_sitter_error": ts_error,
+            "tree_sitter_root_has_error": bool(root.has_error) if root is not None else None,
+        },
+        "range_comparison": compare_decl_ranges(data, scanner, ts_items),
+        "pattern_owners": debug_pattern_owners(data, pattern, scanner, ts_items, int(args.get("hit_limit") or 20)),
+        "tree_sitter_errors": collect_ts_errors(data, root, max_errors, focus_byte),
+        "scanner_declarations": select_debug_decls(data, scanner, pattern, decl_limit),
+        "tree_sitter_declarations": select_debug_decls(data, ts_items, pattern, decl_limit),
+        "regex_declarations": select_debug_decls(data, regex, pattern, decl_limit),
+    }
+    if args.get("include_source"):
+        report["source"] = data.decode("utf-8", "replace")
+    return report
+
 def regex_decls(data):
     text = data.decode("utf-8", "replace")
     ms = list(DECL_RE.finditer(text)); out = []
@@ -1852,6 +2076,7 @@ TOOLS = {
  "remove_project": ("Delete one indexed project cache database. Requires project or repo_path unless allow_default is true.", {"type":"object","properties":{"repo_path":{"type":"string"},"project":{"type":"string"},"allow_default":{"type":"boolean"}}}),
  "list_projects": ("List configured local Lean projects.", {"type":"object","properties":{}}),
  "index_visibility": ("Report tracked/untracked indexed files, stale files, and root-import exposure.", {"type":"object","properties":{"repo_path":{"type":"string"},"project":{"type":"string"},"details":{"type":"boolean"},"root":{"type":"string"},"roots":{"type":"array","items":{"type":"string"}},"topic":{"type":"string"},"path_prefix":{"type":"string"},"detail_limit":{"type":"integer"}}}),
+ "debug_parse_file": ("Debug parser/indexing for one Lean file: compares scanner, tree-sitter, and regex declaration ranges; reports swallowed declarations and tree-sitter ERROR nodes.", {"type":"object","properties":{"repo_path":{"type":"string"},"project":{"type":"string"},"file":{"type":"string"},"file_path":{"type":"string"},"path_prefix":{"type":"string"},"pattern":{"type":"string"},"name":{"type":"string"},"qualified_name":{"type":"string"},"max_errors":{"type":"integer"},"decl_limit":{"type":"integer"},"hit_limit":{"type":"integer"},"include_source":{"type":"boolean"}}}),
  "search_shape": ("Search theorem-like declarations by syntactic type-shape overlap, e.g. Matrix.trace (cfc f A) = _ or HasDerivAt inverse affine-line shapes.", {"type":"object","properties":{"shape":{"type":"string"},"query":{"type":"string"},"type":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"min_score":{"type":"integer"},"cards":{"type":"boolean"},"include_source":{"type":"boolean"},"repo_path":{"type":"string"},"project":{"type":"string"},"topic":{"type":"string"},"path_prefix":{"type":"string"},"path_filter":{"type":"string"},"file_pattern":{"type":"string"}}}),
  "theorem_card": ("Return a rich theorem card: statement, import, location, namespace, typeclass hints, and minimal #check.", {"type":"object","properties":{"qualified_name":{"type":"string"},"name":{"type":"string"},"include_source":{"type":"boolean"},"repo_path":{"type":"string"},"project":{"type":"string"}}}),
  "proof_probe": ("Generate a temporary Lean file and run lake env lean for #check/example probes; reports import/name/typeclass/type mismatch diagnostics.", {"type":"object","properties":{"project":{"type":"string"},"repo_path":{"type":"string"},"run_project":{"type":"string"},"run_repo_path":{"type":"string"},"imports":{"type":"array","items":{"type":"string"}},"checks":{"type":"array","items":{"type":"string"}},"check":{"type":"string"},"qualified_name":{"type":"string"},"name":{"type":"string"},"goal":{"type":"string"},"proof":{"type":"string"},"example":{"type":"string"},"code":{"type":"string"},"timeout_sec":{"type":"integer"},"verbose":{"type":"boolean"},"full_type":{"type":"boolean"},"pp_all":{"type":"boolean"}}}),
@@ -1879,6 +2104,7 @@ def call_tool(name, args, default_repo):
     if name == "index_repository": return index_repository(args, repo)
     if name == "index_status": return index_status(args, repo)
     if name == "index_visibility": return index_visibility(args, repo)
+    if name == "debug_parse_file": return debug_parse_file(args, repo)
     if name == "search_graph": return search_graph(args, repo)
     if name == "search_theorems": return search_theorems(args, repo)
     if name == "search_shape": return search_shape(args, repo)
@@ -1930,7 +2156,11 @@ def main():
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--search")
     ap.add_argument("--index-args")
+    ap.add_argument("--debug-parse", help="Debug parser ranges for a Lean file relative to --repo")
+    ap.add_argument("--debug-pattern", help="Pattern/name to highlight in --debug-parse output")
+    ap.add_argument("--debug-max-errors", type=int, default=30)
     ns = ap.parse_args(); repo = Path(ns.repo).resolve()
+    if ns.debug_parse: print(json.dumps(debug_parse_file({"file": ns.debug_parse, "pattern": ns.debug_pattern, "max_errors": ns.debug_max_errors}, repo), ensure_ascii=False, indent=2)); return 0
     if ns.index_args: print(json.dumps(index_repository(json.loads(ns.index_args), repo), ensure_ascii=False, indent=2)); return 0
     if ns.index: print(json.dumps(index_repository({"mode":"full" if ns.full else "incremental"}, repo), ensure_ascii=False, indent=2)); return 0
     if ns.status: print(json.dumps(index_status({}, repo), ensure_ascii=False, indent=2)); return 0
