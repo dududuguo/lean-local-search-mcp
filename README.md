@@ -23,7 +23,7 @@ Use `repo_path` for explicit repositories. If you configure project aliases, the
 
 ## Main Tools
 
-- `index_repository`: incremental and resumable indexing with path filters and batch sizes.
+- `index_repository`: incremental and resumable indexing with path filters and batch sizes. Returns `total_indexed_files` for the full cache and `scope_indexed_files` for the requested path scope; `indexed_files` is kept as the legacy total-count alias.
 - `index_status`, `index_visibility`, `cache_status`, `remove_project`: cache, stale-file, and root-import visibility checks.
 - `search_graph`, `search_code`: declaration and source search.
 - `search_theorems`, `search_shape`: theorem search by name, symbols, conclusion, premises, and syntactic type shape.

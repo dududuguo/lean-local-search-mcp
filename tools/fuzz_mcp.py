@@ -211,6 +211,14 @@ def main() -> int:
             assert second is not None and second["qn"] == "Fuzz.calc_range_second", second["qn"] if second else None
             first_src = con.execute("SELECT src FROM decls WHERE name=?", ("calc_range_first",)).fetchone()["src"]
             assert "calc_range_second" not in first_src, first_src
+            scoped = mod.index_repository({"mode": "resume", "paths": ["FuzzRepo/Basic.lean", "FuzzRepo/Matrix.lean"], "batch_size": 5}, temp_root)
+            assert scoped["scope_indexed_files"] == 2, scoped
+            assert scoped["total_indexed_files"] >= scoped["scope_indexed_files"], scoped
+            assert scoped["indexed_files"] == scoped["total_indexed_files"], scoped
+            card = mod.theorem_card_tool({"repo_path": str(temp_root), "qualified_name": "Fuzz.add_zero_shape"}, temp_root)["card"]
+            assert card["kind"] == "theorem" and card["label"] == "Theorem", card
+            code_hit = mod.search_code({"repo_path": str(temp_root), "pattern": "add_zero_shape", "limit": 1}, temp_root)["results"][0]
+            assert code_hit["qualified_name"] == "Fuzz.add_zero_shape" and code_hit["label"] == "Theorem", code_hit
         finally:
             con.close()
         for i in range(args.iterations):

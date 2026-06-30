@@ -1135,7 +1135,9 @@ def index_repository(args, repo):
     with con:
         con.execute("INSERT OR REPLACE INTO meta VALUES ('indexed_at', ?)", (str(int(time.time())),))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('index_phase', 'ready')")
-    result = {"project": project_name(repo), "repo_path": str(repo), "db_path": str(db_path(repo)), "mode": "full" if full and not resume else "resume" if resume else "incremental", "scope": scope_description(args), "indexed_files": table_count(con, "files"), "declarations": table_count(con, "decls"), "imports": total_imports(con), "changed_files": len(changed_rels), "changed_declarations": nchanged_decls, "removed_files": len(removed_rels), "skipped_files": max(0, len(current) - len(changed_rels)), "batch_size": batch_size, "elapsed_ms": round((time.time() - t0) * 1000)}
+    total_indexed_files = table_count(con, "files")
+    scope_indexed_files = sum(1 for r in con.execute("SELECT path FROM files") if file_in_scope(r["path"], args)) if scoped else total_indexed_files
+    result = {"project": project_name(repo), "repo_path": str(repo), "db_path": str(db_path(repo)), "mode": "full" if full and not resume else "resume" if resume else "incremental", "scope": scope_description(args), "indexed_files": total_indexed_files, "total_indexed_files": total_indexed_files, "scope_indexed_files": scope_indexed_files, "declarations": table_count(con, "decls"), "imports": total_imports(con), "changed_files": len(changed_rels), "changed_declarations": nchanged_decls, "removed_files": len(removed_rels), "skipped_files": max(0, len(current) - len(changed_rels)), "batch_size": batch_size, "elapsed_ms": round((time.time() - t0) * 1000)}
     con.close()
     return result
 
@@ -1152,8 +1154,19 @@ def ensure_index(repo):
     if needs_index:
         index_repository({"mode": "full"}, repo)
 
+def decl_label(kind):
+    kind = str(kind or "")
+    if kind in TYPE_KINDS:
+        return "Type"
+    if kind in {"theorem", "lemma"}:
+        return "Theorem"
+    if kind == "abbrev":
+        return "Abbrev"
+    return "Function"
+
+
 def row_result(r):
-    return {"name": r["name"], "qualified_name": r["qn"], "label": "Type" if r["kind"] in TYPE_KINDS else "Function", "kind": r["kind"], "file_path": r["file"], "start_line": r["start_line"], "end_line": r["end_line"], "in_degree": 0, "out_degree": 0, "lines": r["end_line"] - r["start_line"] + 1, "is_test": "Test" in r["file"]}
+    return {"name": r["name"], "qualified_name": r["qn"], "label": decl_label(r["kind"]), "kind": r["kind"], "file_path": r["file"], "start_line": r["start_line"], "end_line": r["end_line"], "in_degree": 0, "out_degree": 0, "lines": r["end_line"] - r["start_line"] + 1, "is_test": "Test" in r["file"]}
 
 def theorem_result(r):
     out = row_result(r)
@@ -1346,8 +1359,10 @@ def search_graph(args, repo):
     name_pat, qn_pat, file_pat, label = args.get("name_pattern"), args.get("qn_pattern"), args.get("file_pattern"), args.get("label")
     def keep(r):
         if label == "Type" and r["kind"] not in TYPE_KINDS: return False
-        if label == "Function" and r["kind"] in TYPE_KINDS: return False
-        if label and label not in {"Type","Function",r["kind"]}: return False
+        if label == "Theorem" and r["kind"] not in {"theorem", "lemma"}: return False
+        if label == "Abbrev" and r["kind"] != "abbrev": return False
+        if label == "Function" and decl_label(r["kind"]) != "Function": return False
+        if label and label not in {"Type","Function","Theorem","Abbrev",r["kind"],decl_label(r["kind"])}: return False
         if file_pat and not fnmatch.fnmatch(r["file"], str(file_pat)): return False
         if name_pat and not re.search(str(name_pat), r["name"]): return False
         if qn_pat and not re.search(str(qn_pat), r["qn"]): return False
@@ -1598,7 +1613,7 @@ def search_code(args, repo):
             if len(results) >= limit: continue
             a,b = max(1,i-ctx), min(len(lines),i+ctx)
             snippet = "\n".join(f"{n}: {lines[n-1]}" for n in range(a,b+1))
-            item = {"node": d["name"] if d else None, "qualified_name": d["qn"] if d else None, "label": "Function" if d else "File", "file": fp, "start_line": d["start_line"] if d else i, "end_line": d["end_line"] if d else i, "match_lines": [i], "snippet": snippet}
+            item = {"node": d["name"] if d else None, "qualified_name": d["qn"] if d else None, "label": decl_label(d["kind"]) if d else "File", "file": fp, "start_line": d["start_line"] if d else i, "end_line": d["end_line"] if d else i, "match_lines": [i], "snippet": snippet}
             if mode == "full" and d: item["source"] = d["src"]
             results.append(item)
     if mode == "files": return {"files": sorted(files)[:limit], "total_grep_matches": total, "total_results": len(files)}
