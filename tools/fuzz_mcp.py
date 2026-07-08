@@ -48,6 +48,8 @@ import FuzzRepo.Matrix
 
 def idFun (x : Nat) : Nat := x
 
+def someLongCamelCaseDeclarationName (x : Nat) : Nat := x + 1
+
 theorem add_zero_shape (n : Nat) : n + 0 = n := by
   exact Nat.add_zero n
 
@@ -219,6 +221,21 @@ def main() -> int:
             assert card["kind"] == "theorem" and card["label"] == "Theorem", card
             code_hit = mod.search_code({"repo_path": str(temp_root), "pattern": "add_zero_shape", "limit": 1}, temp_root)["results"][0]
             assert code_hit["qualified_name"] == "Fuzz.add_zero_shape" and code_hit["label"] == "Theorem", code_hit
+            camel_qn = "Fuzz.someLongCamelCaseDeclarationName"
+            exact_code = mod.get_code_snippet({"repo_path": str(temp_root), "qualified_name": camel_qn}, temp_root)
+            assert exact_code["found"] and exact_code["qualified_name"] == camel_qn, exact_code
+            for pattern in ["someLongCamelCase", "%someLongCamelCase%", "*someLongCamelCase*"]:
+                hits = mod.search_graph({"repo_path": str(temp_root), "name_pattern": pattern, "limit": 10}, temp_root)["results"]
+                assert any(hit["qualified_name"] == camel_qn for hit in hits), (pattern, hits)
+            for query in ["CamelCaseDeclaration", "Long Camel Case Declaration"]:
+                hits = mod.search_graph({"repo_path": str(temp_root), "query": query, "limit": 10}, temp_root)["results"]
+                assert any(hit["qualified_name"] == camel_qn for hit in hits), (query, hits)
+            try:
+                mod.search_graph({"repo_path": str(temp_root), "name_pattern": "[bad", "limit": 1}, temp_root)
+            except ValueError as exc:
+                assert "name_pattern uses regex syntax" in str(exc), exc
+            else:
+                raise AssertionError("invalid name_pattern should raise a friendly ValueError")
         finally:
             con.close()
         for i in range(args.iterations):

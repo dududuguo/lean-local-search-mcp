@@ -32,6 +32,14 @@ Use `repo_path` for explicit repositories. If you configure project aliases, the
 - `consumer_fit`, `cross_repo_lookup`: heuristic API matching across indexed repositories.
 - `debug_parse_file`: compare scanner, tree-sitter, and regex declaration ranges for one Lean file.
 
+## Search Semantics
+
+- `search_graph.query` tokenizes CamelCase, snake_case, qualified names, and words, then ranks matches across declaration name, qualified name, statement/signature, docstring, file path, and head symbols.
+- `name_pattern` and `qn_pattern` use Python regex by default. Plain substrings such as `trace` work because matching is unanchored.
+- Common compatibility patterns are also accepted: SQL-LIKE `%trace%` and glob-style `*trace*` / `trace*`.
+- Invalid regexes return an actionable error suggesting `foo`, `.*foo.*`, `%foo%`, or `*foo*`.
+- `file_pattern` is glob-style, with `%` accepted as a SQL-LIKE alias for `*`.
+
 ## Typical Calls
 
 ```json

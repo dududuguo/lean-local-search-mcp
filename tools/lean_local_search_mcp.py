@@ -356,7 +356,7 @@ def file_in_scope(rel, args):
         return True
     rel = norm_rel(rel)
     file_pat = args.get("file_pattern")
-    if file_pat and not fnmatch.fnmatch(rel, str(file_pat)):
+    if file_pat and not file_pattern_matches(file_pat, rel):
         return False
     path_filter = args.get("path_filter")
     if path_filter and not re.search(str(path_filter), rel):
@@ -1027,7 +1027,7 @@ def insert_file_index(con, repo, path, seen_qn):
                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                           (d["qn"],d["name"],d["kind"],d["file"],d["start_line"],d["end_line"],d["start_byte"],d["end_byte"],d["namespace"],d["stmt"],d["proof"],d["src"],d["doc"],d["signature"],d["binders_json"],d["premises"],d["conclusion"],d["head_symbols"]))
         con.execute("INSERT INTO decl_fts(rowid,qn,name,kind,file,namespace,stmt,proof,src,doc,signature,premises,conclusion,head_symbols) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (cur.lastrowid,d["qn"],d["name"],d["kind"],d["file"],d["namespace"],d["stmt"],d["proof"],d["src"],d["doc"],d["signature"],d["premises"],d["conclusion"],d["head_symbols"]))
+                    (cur.lastrowid,search_index_text(d["qn"]),search_index_text(d["name"]),d["kind"],search_index_text(d["file"]),search_index_text(d["namespace"]),search_index_text(d["stmt"]),d["proof"],d["src"],search_index_text(d["doc"]),search_index_text(d["signature"]),search_index_text(d["premises"]),search_index_text(d["conclusion"]),search_index_text(d["head_symbols"])))
         ndecl += 1
     return ndecl
 
@@ -1232,6 +1232,98 @@ def compact_decl_key(value):
     return "".join(ch.lower() for ch in str(value or "") if ch.isalnum())
 
 
+def camel_case_parts(value):
+    text = str(value or "")
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    return [part for part in re.split(r"[^A-Za-z0-9]+", text) if part]
+
+
+def identifier_search_terms(value):
+    seen, out = set(), []
+
+    def add(term):
+        term = str(term or "").strip()
+        if not term:
+            return
+        key = term.lower()
+        if key in seen:
+            return
+        seen.add(key); out.append(term)
+
+    for ident in lean_identifiers(value):
+        add(ident)
+        for part in re.split(r"[._'`]+", ident):
+            add(part)
+            for camel in camel_case_parts(part):
+                add(camel)
+        compact = compact_decl_key(ident)
+        if compact and compact != ident.lower():
+            add(compact)
+    return out
+
+
+def search_index_text(*values):
+    chunks = []
+    for value in values:
+        if value is None:
+            continue
+        chunks.append(str(value))
+        terms = identifier_search_terms(value)
+        if terms:
+            chunks.append(" ".join(terms))
+    return " ".join(chunks)
+
+
+def sql_like_to_regex(pattern):
+    out = ["^"]
+    for ch in str(pattern):
+        if ch == "%":
+            out.append(".*")
+        elif ch == "_":
+            out.append(".")
+        else:
+            out.append(re.escape(ch))
+    out.append("$")
+    return "".join(out)
+
+
+def sql_like_to_glob(pattern):
+    return str(pattern).replace("%", "*").replace("_", "?")
+
+
+def looks_like_simple_glob(pattern):
+    text = str(pattern)
+    if not any(ch in text for ch in "*?"):
+        return False
+    regex_only = set(".^$+{}[]()|\\")
+    return not any(ch in regex_only for ch in text)
+
+
+def compile_user_pattern(pattern, field_name):
+    if pattern is None or str(pattern) == "":
+        return None
+    text = str(pattern)
+    try:
+        if "%" in text:
+            return re.compile(sql_like_to_regex(text))
+        if looks_like_simple_glob(text):
+            return re.compile(fnmatch.translate(text))
+        return re.compile(text)
+    except re.error as exc:
+        raise ValueError(
+            f"{field_name} uses regex syntax. Use 'foo' or '.*foo.*' for substring matching; "
+            f"SQL-LIKE '%foo%' and glob '*foo*' are also accepted. Regex error: {exc}"
+        ) from exc
+
+
+def file_pattern_matches(pattern, path):
+    if not pattern:
+        return True
+    text = sql_like_to_glob(pattern) if "%" in str(pattern) else str(pattern)
+    return fnmatch.fnmatch(norm_rel(path), text)
+
+
 def decl_suggestions(con, q, limit=10, kinds=None):
     q = str(q or "").strip()
     if not q:
@@ -1315,11 +1407,11 @@ def suggestion_response(con, q, limit=10, kinds=None):
 
 
 def fts(q):
-    toks = lean_identifiers(q)
-    return " OR ".join(f'"{t}"' for t in toks) if toks else str(q).replace('"', '""')
+    toks = query_tokens(q)
+    return " OR ".join(f'"{t.replace(chr(34), chr(34) + chr(34))}"' for t in toks) if toks else str(q).replace('"', '""')
 
 def query_tokens(value):
-    return [t.lower() for t in lean_identifiers(value)]
+    return [t.lower() for t in identifier_search_terms(value)]
 
 
 def contains_all(text, toks):
@@ -1332,45 +1424,89 @@ def contains_any(text, toks):
     return any(t in lower for t in toks)
 
 
+def queryable_text(*values):
+    return search_index_text(*values).lower()
+
+
+def query_match_score(row, toks, raw_query):
+    raw_query = str(raw_query or "").strip()
+    if not raw_query and not toks:
+        return 0
+    name_text = queryable_text(row["name"], row["qn"])
+    theorem_text = queryable_text(row["conclusion"], row["premises"], row["head_symbols"])
+    stmt_text = queryable_text(row["stmt"], row["signature"])
+    doc_text = queryable_text(row["doc"])
+    file_text = queryable_text(row["file"])
+    query_lower = raw_query.lower()
+    compact_query = compact_decl_key(raw_query)
+    name_compact = compact_decl_key((row["name"] or "") + " " + (row["qn"] or ""))
+    score = 0
+    if query_lower and query_lower in name_text:
+        score += 520
+    if compact_query and compact_query in name_compact:
+        score += 500
+    if toks:
+        if contains_all(name_text, toks): score += 460
+        elif contains_any(name_text, toks): score += 340
+        if contains_all(theorem_text, toks): score += 240
+        elif contains_any(theorem_text, toks): score += 170
+        if contains_all(stmt_text, toks): score += 140
+        elif contains_any(stmt_text, toks): score += 95
+        if contains_all(doc_text, toks): score += 110
+        elif contains_any(doc_text, toks): score += 75
+        if contains_all(file_text, toks): score += 80
+        elif contains_any(file_text, toks): score += 55
+    return score
+
+
 def search_graph(args, repo):
-    ensure_index(repo); con = connect(repo)
     limit = int(args.get("limit") or 50); offset = int(args.get("offset") or 0)
+    name_rx = compile_user_pattern(args.get("name_pattern"), "name_pattern")
+    qn_rx = compile_user_pattern(args.get("qn_pattern"), "qn_pattern")
+    file_pat, label = args.get("file_pattern"), args.get("label")
+    ensure_index(repo); con = connect(repo)
     if args.get("query"):
-        rows = list(con.execute("SELECT d.*, bm25(decl_fts) rank FROM decl_fts JOIN decls d ON d.id=decl_fts.rowid WHERE decl_fts MATCH ? ORDER BY rank", (fts(args["query"]),)))
-        toks = query_tokens(args["query"])
-        def query_priority(row):
-            name_text = (row["name"] + " " + row["qn"]).lower()
-            theorem_text = "\n".join([row["conclusion"] or "", row["premises"] or "", row["head_symbols"] or ""]).lower()
-            stmt_text = (row["stmt"] or "").lower()
-            if toks and all(t in name_text for t in toks):
-                bucket = 0
-            elif toks and any(t in name_text for t in toks):
-                bucket = 1
-            elif toks and any(t in theorem_text for t in toks):
-                bucket = 2
-            elif toks and any(t in stmt_text for t in toks):
-                bucket = 3
-            else:
-                bucket = 4
-            return (bucket, row["rank"])
-        rows.sort(key=query_priority)
+        query = str(args.get("query") or "")
+        toks = query_tokens(query)
+        by_qn, scores, fts_ranks = {}, {}, {}
+        try:
+            fts_rows = con.execute("SELECT d.*, bm25(decl_fts) rank FROM decl_fts JOIN decls d ON d.id=decl_fts.rowid WHERE decl_fts MATCH ? ORDER BY rank", (fts(query),)).fetchall()
+        except sqlite3.Error:
+            fts_rows = []
+        for r in fts_rows:
+            qn = r["qn"]
+            by_qn[qn] = r
+            fts_ranks[qn] = r["rank"] if r["rank"] is not None else 0
+            scores[qn] = max(scores.get(qn, 0), query_match_score(r, toks, query), 25)
+        for r in con.execute("SELECT * FROM decls"):
+            score = query_match_score(r, toks, query)
+            if score <= 0:
+                continue
+            qn = r["qn"]
+            by_qn.setdefault(qn, r)
+            scores[qn] = max(scores.get(qn, 0), score)
+        rows = list(by_qn.values())
+        rows.sort(key=lambda r: (-scores.get(r["qn"], 0), fts_ranks.get(r["qn"], 1e9), len(r["qn"] or ""), r["file"], r["start_line"]))
     else:
         rows = list(con.execute("SELECT * FROM decls ORDER BY file,start_line"))
-    name_pat, qn_pat, file_pat, label = args.get("name_pattern"), args.get("qn_pattern"), args.get("file_pattern"), args.get("label")
     def keep(r):
         if label == "Type" and r["kind"] not in TYPE_KINDS: return False
         if label == "Theorem" and r["kind"] not in {"theorem", "lemma"}: return False
         if label == "Abbrev" and r["kind"] != "abbrev": return False
         if label == "Function" and decl_label(r["kind"]) != "Function": return False
         if label and label not in {"Type","Function","Theorem","Abbrev",r["kind"],decl_label(r["kind"])}: return False
-        if file_pat and not fnmatch.fnmatch(r["file"], str(file_pat)): return False
-        if name_pat and not re.search(str(name_pat), r["name"]): return False
-        if qn_pat and not re.search(str(qn_pat), r["qn"]): return False
+        if file_pat and not file_pattern_matches(file_pat, r["file"]): return False
+        if name_rx and not name_rx.search(r["name"] or ""): return False
+        if qn_rx and not qn_rx.search(r["qn"] or ""): return False
         return True
     filt = [r for r in rows if keep(r)]; page = filt[offset:offset+limit]
-    return {"total": len(filt), "results": [row_result(r) for r in page], "has_more": offset + len(page) < len(filt)}
+    out = {"total": len(filt), "results": [row_result(r) for r in page], "has_more": offset + len(page) < len(filt)}
+    con.close()
+    return out
 
 def search_theorems(args, repo):
+    name_rx = compile_user_pattern(args.get("name_pattern"), "name_pattern")
+    qn_rx = compile_user_pattern(args.get("qn_pattern"), "qn_pattern")
     ensure_index(repo); con = connect(repo)
     limit = int(args.get("limit") or 50); offset = int(args.get("offset") or 0)
     toks = query_tokens(args.get("query"))
@@ -1380,14 +1516,14 @@ def search_theorems(args, repo):
     query_shape_terms = shape_terms(args.get("query"))
     conclusion_shape_terms = shape_terms(args.get("conclusion"))
     symbol_shape_terms = shape_terms(args.get("symbol") or args.get("symbols"))
-    name_pat, qn_pat, file_pat = args.get("name_pattern"), args.get("qn_pattern"), args.get("file_pattern")
+    file_pat = args.get("file_pattern")
     rows = list(con.execute("SELECT * FROM decls WHERE kind IN ('theorem','lemma','abbrev')"))
     scored = []
     for r in rows:
-        if file_pat and not fnmatch.fnmatch(r["file"], str(file_pat)): continue
+        if file_pat and not file_pattern_matches(file_pat, r["file"]): continue
         if not file_in_scope(r["file"], args): continue
-        if name_pat and not re.search(str(name_pat), r["name"]): continue
-        if qn_pat and not re.search(str(qn_pat), r["qn"]): continue
+        if name_rx and not name_rx.search(r["name"] or ""): continue
+        if qn_rx and not qn_rx.search(r["qn"] or ""): continue
         short_name = r["name"] or ""
         qn_text = r["qn"] or ""
         name_text = f"{short_name} {qn_text}"
@@ -1558,7 +1694,7 @@ def search_shape(args, repo):
     rows = list(con.execute("SELECT * FROM decls WHERE kind IN ('theorem','lemma','abbrev')"))
     scored = []
     for r in rows:
-        if file_pat and not fnmatch.fnmatch(r["file"], str(file_pat)): continue
+        if file_pat and not file_pattern_matches(file_pat, r["file"]): continue
         if not file_in_scope(r["file"], args): continue
         score, cand_terms, overlap = shape_score(qterms, r)
         if score < min_score:
@@ -1568,7 +1704,7 @@ def search_shape(args, repo):
     if not scored and not args.get("strict"):
         relaxed = True
         for r in rows:
-            if file_pat and not fnmatch.fnmatch(r["file"], str(file_pat)): continue
+            if file_pat and not file_pattern_matches(file_pat, r["file"]): continue
             if not file_in_scope(r["file"], args): continue
             score, cand_terms, overlap = shape_score(qterms, r, False)
             if score < min_score:
@@ -1599,7 +1735,7 @@ def search_code(args, repo):
     results, total, seen, files = [], 0, set(), set()
     for fr in con.execute("SELECT * FROM files ORDER BY path"):
         fp = fr["path"]
-        if file_pat and not fnmatch.fnmatch(fp, str(file_pat)): continue
+        if file_pat and not file_pattern_matches(file_pat, fp): continue
         if path_filter and not re.search(str(path_filter), fp): continue
         lines = fr["content"].splitlines()
         for i, line in enumerate(lines, 1):
@@ -2098,8 +2234,8 @@ TOOLS = {
  "consumer_fit": ("Heuristically match a consumer theorem premise/conclusion shape against provider/HighDimProb/Mathlib candidate leaf theorems.", {"type":"object","properties":{"consumer":{"type":"string"},"qualified_name":{"type":"string"},"name":{"type":"string"},"project":{"type":"string"},"projects":{"type":"array","items":{"type":"string"}},"max_obligations":{"type":"integer"},"candidates_per_obligation":{"type":"integer"}}}),
  "cross_repo_lookup": ("Search provider/HighDimProb/Mathlib for same-name declarations and textual users.", {"type":"object","properties":{"query":{"type":"string"},"name":{"type":"string"},"qualified_name":{"type":"string"},"projects":{"type":"array","items":{"type":"string"}},"limit":{"type":"integer"}}}),
  "project_templates": ("Return HighDimProb/LiebProvider-specific search and proof-probe templates.", {"type":"object","properties":{}}),
- "search_graph": ("Search Lean declarations by FTS query, name_pattern, qn_pattern, file_pattern, or label.", {"type":"object","properties":{"query":{"type":"string"},"name_pattern":{"type":"string"},"qn_pattern":{"type":"string"},"file_pattern":{"type":"string"},"label":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"repo_path":{"type":"string"},"project":{"type":"string"}}}),
- "search_theorems": ("Lean-aware theorem-like search over theorem/lemma/abbrev names, conclusions, premises, and head symbols. Pass cards=true for rich theorem cards; topic/path filters are supported.", {"type":"object","properties":{"query":{"type":"string"},"conclusion":{"type":"string"},"premise":{"type":"string"},"symbol":{"type":"string"},"name_pattern":{"type":"string"},"qn_pattern":{"type":"string"},"file_pattern":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"repo_path":{"type":"string"},"project":{"type":"string"},"topic":{"type":"string"},"path_prefix":{"type":"string"},"path_filter":{"type":"string"},"cards":{"type":"boolean"},"include_source":{"type":"boolean"}}}),
+ "search_graph": ("Search Lean declarations. query tokenizes CamelCase/snake_case and ranks names, qualified names, statements, docs, files, and head symbols; name_pattern/qn_pattern accept regex plus %foo% and *foo* compatibility; file_pattern is glob-style.", {"type":"object","properties":{"query":{"type":"string"},"name_pattern":{"type":"string"},"qn_pattern":{"type":"string"},"file_pattern":{"type":"string"},"label":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"repo_path":{"type":"string"},"project":{"type":"string"}}}),
+ "search_theorems": ("Lean-aware theorem-like search over theorem/lemma/abbrev names, conclusions, premises, and head symbols. name_pattern/qn_pattern accept regex plus %foo% and *foo* compatibility. Pass cards=true for rich theorem cards; topic/path filters are supported.", {"type":"object","properties":{"query":{"type":"string"},"conclusion":{"type":"string"},"premise":{"type":"string"},"symbol":{"type":"string"},"name_pattern":{"type":"string"},"qn_pattern":{"type":"string"},"file_pattern":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"repo_path":{"type":"string"},"project":{"type":"string"},"topic":{"type":"string"},"path_prefix":{"type":"string"},"path_filter":{"type":"string"},"cards":{"type":"boolean"},"include_source":{"type":"boolean"}}}),
  "search_code": ("Search raw Lean source and return declaration-aware hits.", {"type":"object","properties":{"pattern":{"type":"string"},"query":{"type":"string"},"regex":{"type":"boolean"},"file_pattern":{"type":"string"},"path_filter":{"type":"string"},"mode":{"type":"string"},"context":{"type":"integer"},"limit":{"type":"integer"},"repo_path":{"type":"string"},"project":{"type":"string"}}}),
  "get_code_snippet": ("Read source for an indexed Lean declaration.", {"type":"object","properties":{"qualified_name":{"type":"string"},"name":{"type":"string"},"include_neighbors":{"type":"boolean"},"repo_path":{"type":"string"},"project":{"type":"string"}}}),
  "get_context": ("Return proof-oriented Lean context for one declaration: imports, local variables, theorem profile, neighbors, and source context.", {"type":"object","properties":{"qualified_name":{"type":"string"},"name":{"type":"string"},"before":{"type":"integer"},"after":{"type":"integer"},"neighbor_radius":{"type":"integer"},"repo_path":{"type":"string"},"project":{"type":"string"}}}),
