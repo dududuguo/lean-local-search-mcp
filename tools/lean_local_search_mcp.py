@@ -2037,7 +2037,7 @@ def normalize_imports(value):
 def diagnose_lean_output(text):
     lower = str(text or "").lower()
     tags = []
-    if "unknown constant" in lower or "unknown identifier" in lower:
+    if "unknown constant" in lower or "unknown identifier" in lower or "unknown module prefix" in lower:
         tags.append("missing_import_or_unknown_name")
     if "application type mismatch" in lower or "type mismatch" in lower:
         tags.append("type_mismatch")
@@ -2050,14 +2050,83 @@ def diagnose_lean_output(text):
     return tags or (["ok"] if "error:" not in lower else ["lean_error"])
 
 
-def proof_probe(args, default_repo):
+def proof_probe_import_context(output, search_repo, run_repo):
+    lower = str(output or "").lower()
+    if "unknown module prefix" not in lower and "no directory" not in lower:
+        return None
+    return (
+        "Lean import resolution used the execution repo "
+        f"{run_repo}; lookup/index context used {search_repo}. "
+        "If this is not intended, pass run_project or run_repo_path explicitly."
+    )
+
+
+def proof_probe_result(ok, exit_code, run_context, probe_file, imports, checks, verbose, timeout, cmd, stdout, stderr, diagnosis, message=None):
+    output = (stdout or "") + (stderr or "")
+    out = {
+        "ok": ok,
+        "exit_code": exit_code,
+        "search_repo": str(run_context["search_repo"]),
+        "run_repo": str(run_context["run_repo"]),
+        "execution_repo": str(run_context["run_repo"]),
+        "search_project": run_context.get("search_project"),
+        "run_project": run_context.get("run_project"),
+        "execution_project": run_context.get("run_project"),
+        "execution_defaulted_to_search_project": run_context["defaulted_to_search"],
+        "explicit_execution_project": run_context["explicit_run_project"],
+        "explicit_execution_repo_path": run_context["explicit_run_repo_path"],
+        "probe_file": str(probe_file),
+        "imports": imports,
+        "checks": checks,
+        "verbose": verbose,
+        "timeout_sec": timeout,
+        "command": " ".join(cmd),
+        "diagnosis": diagnosis,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+    if message:
+        out["message"] = message
+    warning = run_context.get("warning")
+    if warning:
+        out["warning"] = warning
+    import_context = proof_probe_import_context(output, run_context["search_repo"], run_context["run_repo"])
+    if import_context:
+        out["import_error_context"] = import_context
+    return out
+
+
+def proof_probe_run_context(args, default_repo):
     search_repo = repo_arg(args, default_repo)
+    explicit_run_project = bool(args.get("run_project"))
+    explicit_run_repo_path = bool(args.get("run_repo_path"))
+    search_project = args.get("project")
+    run_project = args.get("run_project") or search_project
     run_args = {}
-    if args.get("run_project"):
-        run_args["project"] = args.get("run_project")
-    if args.get("run_repo_path"):
+    if run_project:
+        run_args["project"] = run_project
+    if explicit_run_repo_path:
         run_args["repo_path"] = args.get("run_repo_path")
-    run_repo = repo_arg(run_args, default_repo) if run_args else default_repo
+    run_repo = repo_arg(run_args, search_repo) if run_args else search_repo
+    defaulted_to_search = not explicit_run_project and not explicit_run_repo_path
+    context = {
+        "search_repo": search_repo,
+        "run_repo": run_repo,
+        "search_project": search_project,
+        "run_project": run_project,
+        "explicit_run_project": explicit_run_project,
+        "explicit_run_repo_path": explicit_run_repo_path,
+        "defaulted_to_search": defaulted_to_search,
+    }
+    if defaulted_to_search and search_repo.resolve() != run_repo.resolve():
+        context["warning"] = "proof_probe execution repo defaulted differently from the lookup/index repo"
+    return context
+
+
+def proof_probe(args, default_repo):
+    run_context = proof_probe_run_context(args, default_repo)
+    search_repo = run_context["search_repo"]
+    run_repo = run_context["run_repo"]
     imports = normalize_imports(args.get("imports"))
     checks = as_list(args.get("checks") or args.get("check") or args.get("qualified_name") or args.get("name"))
     ensure_index(search_repo); con = connect(search_repo)
@@ -2093,10 +2162,23 @@ def proof_probe(args, default_repo):
     try:
         proc = subprocess.run(cmd, cwd=str(run_repo), text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=timeout)
         output = (proc.stdout or "") + (proc.stderr or "")
-        return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "run_repo": str(run_repo), "probe_file": str(probe_file), "imports": imports, "checks": checks, "verbose": verbose, "timeout_sec": timeout, "command": " ".join(cmd), "diagnosis": diagnose_lean_output(output), "stdout": proc.stdout, "stderr": proc.stderr}
+        return proof_probe_result(proc.returncode == 0, proc.returncode, run_context, probe_file, imports, checks, verbose, timeout, cmd, proc.stdout, proc.stderr, diagnose_lean_output(output))
     except subprocess.TimeoutExpired as exc:
-        return {"ok": False, "exit_code": None, "run_repo": str(run_repo), "probe_file": str(probe_file), "imports": imports, "checks": checks, "verbose": verbose, "timeout_sec": timeout, "command": " ".join(cmd), "diagnosis": ["timeout"], "message": f"lake env lean exceeded timeout_sec={timeout}; increase timeout_sec for heavy Mathlib imports or use narrower imports.", "stdout": exc.stdout, "stderr": exc.stderr}
-
+        return proof_probe_result(
+            False,
+            None,
+            run_context,
+            probe_file,
+            imports,
+            checks,
+            verbose,
+            timeout,
+            cmd,
+            exc.stdout,
+            exc.stderr,
+            ["timeout"],
+            f"lake env lean exceeded timeout_sec={timeout}; increase timeout_sec for heavy Mathlib imports or use narrower imports.",
+        )
 
 def configured_repos(default_repo, names=None):
     repos, seen = [], set()
@@ -2230,7 +2312,7 @@ TOOLS = {
  "debug_parse_file": ("Debug parser/indexing for one Lean file: compares scanner, tree-sitter, and regex declaration ranges; reports swallowed declarations and tree-sitter ERROR nodes.", {"type":"object","properties":{"repo_path":{"type":"string"},"project":{"type":"string"},"file":{"type":"string"},"file_path":{"type":"string"},"path_prefix":{"type":"string"},"pattern":{"type":"string"},"name":{"type":"string"},"qualified_name":{"type":"string"},"max_errors":{"type":"integer"},"decl_limit":{"type":"integer"},"hit_limit":{"type":"integer"},"include_source":{"type":"boolean"}}}),
  "search_shape": ("Search theorem-like declarations by syntactic type-shape overlap, e.g. Matrix.trace (cfc f A) = _ or HasDerivAt inverse affine-line shapes.", {"type":"object","properties":{"shape":{"type":"string"},"query":{"type":"string"},"type":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"min_score":{"type":"integer"},"cards":{"type":"boolean"},"include_source":{"type":"boolean"},"repo_path":{"type":"string"},"project":{"type":"string"},"topic":{"type":"string"},"path_prefix":{"type":"string"},"path_filter":{"type":"string"},"file_pattern":{"type":"string"}}}),
  "theorem_card": ("Return a rich theorem card: statement, import, location, namespace, typeclass hints, and minimal #check.", {"type":"object","properties":{"qualified_name":{"type":"string"},"name":{"type":"string"},"include_source":{"type":"boolean"},"repo_path":{"type":"string"},"project":{"type":"string"}}}),
- "proof_probe": ("Generate a temporary Lean file and run lake env lean for #check/example probes; reports import/name/typeclass/type mismatch diagnostics.", {"type":"object","properties":{"project":{"type":"string"},"repo_path":{"type":"string"},"run_project":{"type":"string"},"run_repo_path":{"type":"string"},"imports":{"type":"array","items":{"type":"string"}},"checks":{"type":"array","items":{"type":"string"}},"check":{"type":"string"},"qualified_name":{"type":"string"},"name":{"type":"string"},"goal":{"type":"string"},"proof":{"type":"string"},"example":{"type":"string"},"code":{"type":"string"},"timeout_sec":{"type":"integer"},"verbose":{"type":"boolean"},"full_type":{"type":"boolean"},"pp_all":{"type":"boolean"}}}),
+ "proof_probe": ("Generate a temporary Lean file and run lake env lean for #check/example probes. project selects lookup/index context; when run_project/run_repo_path are omitted, execution defaults to the same selected project. Reports search_repo/run_repo and import/name/typeclass/type mismatch diagnostics.", {"type":"object","properties":{"project":{"type":"string"},"repo_path":{"type":"string"},"run_project":{"type":"string"},"run_repo_path":{"type":"string"},"imports":{"type":"array","items":{"type":"string"}},"checks":{"type":"array","items":{"type":"string"}},"check":{"type":"string"},"qualified_name":{"type":"string"},"name":{"type":"string"},"goal":{"type":"string"},"proof":{"type":"string"},"example":{"type":"string"},"code":{"type":"string"},"timeout_sec":{"type":"integer"},"verbose":{"type":"boolean"},"full_type":{"type":"boolean"},"pp_all":{"type":"boolean"}}}),
  "consumer_fit": ("Heuristically match a consumer theorem premise/conclusion shape against provider/HighDimProb/Mathlib candidate leaf theorems.", {"type":"object","properties":{"consumer":{"type":"string"},"qualified_name":{"type":"string"},"name":{"type":"string"},"project":{"type":"string"},"projects":{"type":"array","items":{"type":"string"}},"max_obligations":{"type":"integer"},"candidates_per_obligation":{"type":"integer"}}}),
  "cross_repo_lookup": ("Search provider/HighDimProb/Mathlib for same-name declarations and textual users.", {"type":"object","properties":{"query":{"type":"string"},"name":{"type":"string"},"qualified_name":{"type":"string"},"projects":{"type":"array","items":{"type":"string"}},"limit":{"type":"integer"}}}),
  "project_templates": ("Return HighDimProb/LiebProvider-specific search and proof-probe templates.", {"type":"object","properties":{}}),

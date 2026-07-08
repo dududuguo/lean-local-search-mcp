@@ -40,6 +40,13 @@ Use `repo_path` for explicit repositories. If you configure project aliases, the
 - Invalid regexes return an actionable error suggesting `foo`, `.*foo.*`, `%foo%`, or `*foo*`.
 - `file_pattern` is glob-style, with `%` accepted as a SQL-LIKE alias for `*`.
 
+## Proof Probe Semantics
+
+- `proof_probe.project` selects the lookup/index project.
+- If `run_project` and `run_repo_path` are omitted, `proof_probe` also executes `lake env lean` in that same selected project.
+- Use `run_project` or `run_repo_path` only when the probe should execute in a different Lean package than the lookup/index project.
+- Probe results report both `search_repo` and `run_repo`; import failures include the execution repo that supplied the Lean search path when relevant.
+
 ## Typical Calls
 
 ```json

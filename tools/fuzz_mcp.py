@@ -236,6 +236,36 @@ def main() -> int:
                 assert "name_pattern uses regex syntax" in str(exc), exc
             else:
                 raise AssertionError("invalid name_pattern should raise a friendly ValueError")
+
+            project_b = temp_root / "ProjectB"
+            make_repo(project_b)
+            mod.index_repository({"mode": "full", "batch_size": 5}, project_b)
+            project_b_name = mod.project_name(project_b)
+            captured = {}
+            original_run = mod.subprocess.run
+
+            class FakeCompleted:
+                returncode = 1
+                stdout = ""
+                stderr = "error: unknown module prefix 'FuzzRepo'\nNo directory 'FuzzRepo' in the search path entries:\n  DefaultRepo/.lake"
+
+            def fake_run(cmd, cwd, **kwargs):
+                captured["cmd"] = cmd
+                captured["cwd"] = cwd
+                captured["kwargs"] = kwargs
+                return FakeCompleted()
+
+            try:
+                mod.subprocess.run = fake_run
+                probe = mod.proof_probe({"project": project_b_name, "imports": ["FuzzRepo.Basic"], "code": "#check Fuzz.idFun", "verbose": True}, temp_root)
+            finally:
+                mod.subprocess.run = original_run
+            assert Path(captured["cwd"]).resolve() == project_b.resolve(), (captured, probe)
+            assert Path(probe["search_repo"]).resolve() == project_b.resolve(), probe
+            assert Path(probe["run_repo"]).resolve() == project_b.resolve(), probe
+            assert probe["run_project"] == project_b_name and probe["execution_defaulted_to_search_project"], probe
+            assert "missing_import_or_unknown_name" in probe["diagnosis"], probe
+            assert "import_error_context" in probe and str(project_b) in probe["import_error_context"], probe
         finally:
             con.close()
         for i in range(args.iterations):
