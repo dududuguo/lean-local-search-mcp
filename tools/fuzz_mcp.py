@@ -13,6 +13,7 @@ import json
 import random
 import shutil
 import string
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -102,6 +103,15 @@ lemma inv_affine_shape (g : Real -> MatrixLike) (t : Real) : HasDerivAt (fun s :
 end Fuzz
 """,
     )
+    write_file(
+        root / "FuzzRepo" / "Wide.lean",
+        "namespace Fuzz\n\n"
+        + "\n".join(
+            f"def relativeEntropyLiebConcavity_{i} : Nat := {i}"
+            for i in range(260)
+        )
+        + "\n\nend Fuzz\n",
+    )
     write_file(root / "docs" / "notes.md", "trace cfc HasDerivAt Matrix random text\n")
 
 
@@ -183,6 +193,93 @@ def assert_jsonable(value):
     json.dumps(value, ensure_ascii=False)
 
 
+def stdio_request(proc, message):
+    assert proc.stdin is not None and proc.stdout is not None
+    proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+    proc.stdin.flush()
+    line = proc.stdout.readline()
+    if not line:
+        stderr = proc.stderr.read() if proc.stderr is not None else ""
+        raise RuntimeError(
+            f"stdio server closed before response: exit={proc.poll()}, stderr={stderr}"
+        )
+    response = json.loads(line)
+    assert "error" not in response, response
+    return response
+
+
+def assert_stdio_pagination_survives(repo: Path) -> None:
+    proc = subprocess.Popen(
+        [sys.executable, str(SERVER_PATH), "--repo", str(repo)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        init = stdio_request(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05"},
+            },
+        )
+        assert "result" in init, init
+        for request_id, offset in ((2, 0), (3, 20)):
+            response = stdio_request(
+                proc,
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "search_graph",
+                        "arguments": {
+                            "repo_path": str(repo),
+                            "query": "relative entropy Lieb concavity",
+                            "limit": 20,
+                            "offset": offset,
+                        },
+                    },
+                },
+            )
+            payload = json.loads(response["result"]["content"][0]["text"])
+            assert payload["total"] >= 260 and payload["has_more"], payload
+            assert len(payload["results"]) == 20, payload
+            assert proc.poll() is None
+        response = stdio_request(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "index_repository",
+                    "arguments": {
+                        "repo_path": str(repo),
+                        "mode": "resume",
+                        "path_prefix": "FuzzRepo",
+                    },
+                },
+            },
+        )
+        assert "result" in response and proc.poll() is None, response
+    finally:
+        if proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.close()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            proc.wait(timeout=10)
+        stderr = proc.stderr.read() if proc.stderr is not None else ""
+        assert proc.returncode == 0, stderr
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--iterations", type=int, default=300)
@@ -205,6 +302,7 @@ def main() -> int:
         make_repo(temp_root)
         initial = mod.index_repository({"mode": "full", "batch_size": 5}, temp_root)
         assert_jsonable(initial)
+        assert_stdio_pagination_survives(temp_root)
         con = mod.connect(temp_root)
         try:
             nested = con.execute("SELECT qn FROM decls WHERE name=?", ("nested_after_section",)).fetchone()

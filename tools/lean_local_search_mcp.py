@@ -1459,50 +1459,100 @@ def query_match_score(row, toks, raw_query):
     return score
 
 
+SEARCH_GRAPH_FIELDS = (
+    "id", "qn", "name", "kind", "file", "start_line", "end_line",
+    "namespace", "stmt", "doc", "signature", "premises", "conclusion",
+    "head_symbols",
+)
+SEARCH_GRAPH_SELECT = ", ".join(SEARCH_GRAPH_FIELDS)
+SEARCH_GRAPH_JOIN_SELECT = ", ".join(
+    f"d.{field} AS {field}" for field in SEARCH_GRAPH_FIELDS
+)
+
+
 def search_graph(args, repo):
-    limit = int(args.get("limit") or 50); offset = int(args.get("offset") or 0)
+    limit = min(100, max(1, int(args.get("limit") or 50)))
+    offset = max(0, int(args.get("offset") or 0))
     name_rx = compile_user_pattern(args.get("name_pattern"), "name_pattern")
     qn_rx = compile_user_pattern(args.get("qn_pattern"), "qn_pattern")
     file_pat, label = args.get("file_pattern"), args.get("label")
-    ensure_index(repo); con = connect(repo)
-    if args.get("query"):
-        query = str(args.get("query") or "")
-        toks = query_tokens(query)
-        by_qn, scores, fts_ranks = {}, {}, {}
-        try:
-            fts_rows = con.execute("SELECT d.*, bm25(decl_fts) rank FROM decl_fts JOIN decls d ON d.id=decl_fts.rowid WHERE decl_fts MATCH ? ORDER BY rank", (fts(query),)).fetchall()
-        except sqlite3.Error:
-            fts_rows = []
-        for r in fts_rows:
-            qn = r["qn"]
-            by_qn[qn] = r
-            fts_ranks[qn] = r["rank"] if r["rank"] is not None else 0
-            scores[qn] = max(scores.get(qn, 0), query_match_score(r, toks, query), 25)
-        for r in con.execute("SELECT * FROM decls"):
-            score = query_match_score(r, toks, query)
-            if score <= 0:
-                continue
-            qn = r["qn"]
-            by_qn.setdefault(qn, r)
-            scores[qn] = max(scores.get(qn, 0), score)
-        rows = list(by_qn.values())
-        rows.sort(key=lambda r: (-scores.get(r["qn"], 0), fts_ranks.get(r["qn"], 1e9), len(r["qn"] or ""), r["file"], r["start_line"]))
-    else:
-        rows = list(con.execute("SELECT * FROM decls ORDER BY file,start_line"))
-    def keep(r):
-        if label == "Type" and r["kind"] not in TYPE_KINDS: return False
-        if label == "Theorem" and r["kind"] not in {"theorem", "lemma"}: return False
-        if label == "Abbrev" and r["kind"] != "abbrev": return False
-        if label == "Function" and decl_label(r["kind"]) != "Function": return False
-        if label and label not in {"Type","Function","Theorem","Abbrev",r["kind"],decl_label(r["kind"])}: return False
-        if file_pat and not file_pattern_matches(file_pat, r["file"]): return False
-        if name_rx and not name_rx.search(r["name"] or ""): return False
-        if qn_rx and not qn_rx.search(r["qn"] or ""): return False
-        return True
-    filt = [r for r in rows if keep(r)]; page = filt[offset:offset+limit]
-    out = {"total": len(filt), "results": [row_result(r) for r in page], "has_more": offset + len(page) < len(filt)}
-    con.close()
-    return out
+    ensure_index(repo)
+    con = connect(repo)
+    try:
+        if args.get("query"):
+            query = str(args.get("query") or "")
+            toks = query_tokens(query)
+            by_qn, scores, fts_ranks = {}, {}, {}
+            try:
+                fts_rows = con.execute(
+                    f"SELECT {SEARCH_GRAPH_JOIN_SELECT}, bm25(decl_fts) rank "
+                    "FROM decl_fts JOIN decls d ON d.id=decl_fts.rowid "
+                    "WHERE decl_fts MATCH ? ORDER BY rank",
+                    (fts(query),),
+                ).fetchall()
+            except sqlite3.Error:
+                fts_rows = []
+            for r in fts_rows:
+                qn = r["qn"]
+                by_qn[qn] = r
+                fts_ranks[qn] = r["rank"] if r["rank"] is not None else 0
+                scores[qn] = max(
+                    scores.get(qn, 0), query_match_score(r, toks, query), 25
+                )
+            for r in con.execute(f"SELECT {SEARCH_GRAPH_SELECT} FROM decls"):
+                score = query_match_score(r, toks, query)
+                if score <= 0:
+                    continue
+                qn = r["qn"]
+                by_qn.setdefault(qn, r)
+                scores[qn] = max(scores.get(qn, 0), score)
+            rows = list(by_qn.values())
+            rows.sort(
+                key=lambda r: (
+                    -scores.get(r["qn"], 0),
+                    fts_ranks.get(r["qn"], 1e9),
+                    len(r["qn"] or ""),
+                    r["file"],
+                    r["start_line"],
+                )
+            )
+        else:
+            rows = list(
+                con.execute(
+                    f"SELECT {SEARCH_GRAPH_SELECT} FROM decls ORDER BY file,start_line"
+                )
+            )
+
+        def keep(r):
+            if label == "Type" and r["kind"] not in TYPE_KINDS:
+                return False
+            if label == "Theorem" and r["kind"] not in {"theorem", "lemma"}:
+                return False
+            if label == "Abbrev" and r["kind"] != "abbrev":
+                return False
+            if label == "Function" and decl_label(r["kind"]) != "Function":
+                return False
+            if label and label not in {
+                "Type", "Function", "Theorem", "Abbrev", r["kind"], decl_label(r["kind"])
+            }:
+                return False
+            if file_pat and not file_pattern_matches(file_pat, r["file"]):
+                return False
+            if name_rx and not name_rx.search(r["name"] or ""):
+                return False
+            if qn_rx and not qn_rx.search(r["qn"] or ""):
+                return False
+            return True
+
+        filt = [r for r in rows if keep(r)]
+        page = filt[offset:offset + limit]
+        return {
+            "total": len(filt),
+            "results": [row_result(r) for r in page],
+            "has_more": offset + len(page) < len(filt),
+        }
+    finally:
+        con.close()
 
 def search_theorems(args, repo):
     name_rx = compile_user_pattern(args.get("name_pattern"), "name_pattern")
