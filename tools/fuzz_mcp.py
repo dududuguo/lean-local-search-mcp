@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import random
 import shutil
 import string
@@ -20,6 +21,11 @@ import traceback
 from pathlib import Path
 
 SERVER_PATH = Path(__file__).resolve().with_name("lean_local_search_mcp.py")
+
+try:
+    from .validate_release import prepare_fixture, validate_release
+except ImportError:
+    from validate_release import prepare_fixture, validate_release
 
 
 def load_server():
@@ -124,7 +130,7 @@ def maybe(rng: random.Random, choices):
     return rng.choice(choices)
 
 
-def random_args(rng: random.Random, tool: str, repo: Path, existing: bool):
+def random_args(rng: random.Random, tool: str, repo: Path, existing: bool, existing_repo: Path | None = None):
     names = [
         "Fuzz.trace_cfc_shape",
         "trace_cfc_shape",
@@ -145,9 +151,10 @@ def random_args(rng: random.Random, tool: str, repo: Path, existing: bool):
     ]
     patterns = ["trace", "cfc", "HasDerivAt", "Matrix", "", rand_text(rng, 16)]
     scopes = [{}, {"path_prefix": "FuzzRepo"}, {"file_pattern": "*.lean"}, {"path_filter": "Matrix|Basic"}]
-    base_project = {"project": rng.choice(["default", "provider", "mathlib"])} if existing else {"repo_path": str(repo)}
+    target_repo = existing_repo if existing and existing_repo is not None else repo
+    base_project = {"repo_path": str(target_repo)}
     if tool == "index_repository":
-        args = {"repo_path": str(repo), "mode": rng.choice(["incremental", "resume", "full"]), "batch_size": rng.randint(1, 20)}
+        args = {"repo_path": str(target_repo), "mode": rng.choice(["incremental", "resume", "full"]), "batch_size": rng.randint(1, 20)}
         args.update(rng.choice(scopes))
         return args
     if tool == "index_status":
@@ -156,7 +163,7 @@ def random_args(rng: random.Random, tool: str, repo: Path, existing: bool):
         args = dict(base_project); args.update({"details": True, "detail_limit": rng.randint(1, 10)}); return args
     if tool == "debug_parse_file":
         if existing:
-            return {"project": "provider", "file": "HighDimProbLiebProvider/TraceExp/LogResolvent.lean", "pattern": "traceMulResolventCutoff", "max_errors": 5, "decl_limit": 5, "hit_limit": 3}
+            return {"repo_path": str(target_repo), "file": "HighDimProb/Concentration/Markov.lean", "pattern": "markov_inequality", "max_errors": 5, "decl_limit": 5, "hit_limit": 3}
         return {"repo_path": str(repo), "file": rng.choice(["FuzzRepo/Basic.lean", "FuzzRepo/Matrix.lean"]), "pattern": rng.choice(["calc_range_second", "trace_cfc_shape", "missing_name"]), "max_errors": 5, "decl_limit": 5, "hit_limit": 3}
     if tool == "cache_status":
         return dict(base_project) if rng.random() < 0.7 else {}
@@ -179,12 +186,8 @@ def random_args(rng: random.Random, tool: str, repo: Path, existing: bool):
     if tool == "project_templates":
         return {}
     if tool == "cross_repo_lookup":
-        if existing:
-            return {"query": rng.choice(["trace_eq_sum_eigenvalues", "eigenvalues_mem_spectrum_real", "missing", rand_text(rng)]), "limit": rng.randint(1, 5)}
         return {"query": rng.choice(names), "projects": ["default"], "limit": rng.randint(1, 5)}
     if tool == "consumer_fit":
-        if existing:
-            return {"project": "provider", "consumer": "epsteinAffineLineConcavity_of_cfcLog_hasDerivAt_traceDerivative_nonpos", "projects": ["provider"], "max_obligations": 1, "candidates_per_obligation": 2}
         return {"project": "default", "consumer": rng.choice(["Fuzz.trace_cfc_shape", "trace_cfc_shape", "missing_name"]), "projects": ["default"], "max_obligations": 2, "candidates_per_obligation": 3}
     return {}
 
@@ -284,13 +287,16 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--iterations", type=int, default=300)
     ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--include-existing", action="store_true", help="Also fuzz read-only calls against provider/mathlib aliases.")
+    ap.add_argument("--include-existing", action="store_true", help="Also validate and fuzz the pinned HighDimProb alpha-0.1 fixture.")
     ap.add_argument("--keep-temp", action="store_true")
     args = ap.parse_args()
     seed = args.seed if args.seed is not None else random.randrange(1 << 32)
     rng = random.Random(seed)
-    mod = load_server()
     temp_root = Path(tempfile.mkdtemp(prefix="lean-local-search-fuzz-"))
+    previous_index_root = os.environ.get("LEAN_SEARCH_INDEX_ROOT")
+    os.environ["LEAN_SEARCH_INDEX_ROOT"] = str(temp_root / ".indexes")
+    mod = load_server()
+    existing_repo = None
     failures = []
     tools = [
         "index_repository", "index_status", "index_visibility", "debug_parse_file", "cache_status", "search_graph",
@@ -299,6 +305,13 @@ def main() -> int:
         "consumer_fit",
     ]
     try:
+        if args.include_existing:
+            existing_repo, fixture_action = prepare_fixture()
+            release_summary = validate_release(existing_repo, index_dir=temp_root / ".indexes")
+            fixture_status = mod.index_status({"repo_path": str(existing_repo)}, existing_repo)
+            assert fixture_status["files"] == 342 and fixture_status["declarations"] == 2560, fixture_status
+            print(f"Pinned release fixture {fixture_action}: {existing_repo}", file=sys.stderr)
+            print(f"Pinned release checks: {', '.join(release_summary['checks'])}", file=sys.stderr)
         make_repo(temp_root)
         initial = mod.index_repository({"mode": "full", "batch_size": 5}, temp_root)
         assert_jsonable(initial)
@@ -369,7 +382,9 @@ def main() -> int:
         for i in range(args.iterations):
             existing = args.include_existing and rng.random() < 0.25
             tool = rng.choice([t for t in tools if existing or t != "index_repository"])
-            call_args = random_args(rng, tool, temp_root, existing)
+            if tool in {"cross_repo_lookup", "consumer_fit"}:
+                existing = False
+            call_args = random_args(rng, tool, temp_root, existing, existing_repo)
             try:
                 result = mod.call_tool(tool, call_args, temp_root)
                 assert_jsonable(result)
@@ -387,6 +402,10 @@ def main() -> int:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 1 if failures else 0
     finally:
+        if previous_index_root is None:
+            os.environ.pop("LEAN_SEARCH_INDEX_ROOT", None)
+        else:
+            os.environ["LEAN_SEARCH_INDEX_ROOT"] = previous_index_root
         if not args.keep_temp and not failures:
             shutil.rmtree(temp_root, ignore_errors=True)
 

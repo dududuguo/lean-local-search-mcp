@@ -221,7 +221,7 @@ def default_repo():
     return Path(os.environ.get("LEAN_SEARCH_REPO") or SERVER_REPO).resolve()
 
 def project_name(repo):
-    return str(repo).replace("\\", "-").replace("/", "-").replace(":", "")
+    return str(Path(repo).resolve()).replace("\\", "-").replace("/", "-").replace(":", "")
 
 def index_root():
     raw = os.environ.get("LEAN_SEARCH_INDEX_ROOT")
